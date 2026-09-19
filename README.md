@@ -4,6 +4,8 @@ English · [Русский](README.ru.md)
 
 A local server with the OpenAI and Anthropic HTTP APIs in front of the `claude` CLI. A client sends an ordinary `/v1/chat/completions` request, the proxy runs `claude --print` with it and returns the answer in the same format.
 
+Setting up JetBrains Air with an agent: [connect the proxy to JetBrains Air through Goose](docs/jetbrains-air.md).
+
 > [!WARNING]
 > Requests are billed to the Claude plan the CLI is logged in with. Anthropic [does not allow](https://code.claude.com/docs/en/agent-sdk/overview) third-party products to use claude.ai login or subscription rate limits without its approval, so running other clients on a Pro or Max plan through this proxy puts the account at risk.
 
@@ -86,7 +88,7 @@ export ANTHROPIC_HOST=http://127.0.0.1:8080 ANTHROPIC_API_KEY=local
 goose session
 ```
 
-As an ACP agent inside an editor, it runs as `goose acp` with the same variables.
+As an ACP agent inside an editor, it runs as `goose acp` with the same variables. Step by step for JetBrains Air: [connect the proxy to JetBrains Air through Goose](docs/jetbrains-air.md).
 
 ## Endpoints
 
