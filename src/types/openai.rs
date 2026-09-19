@@ -10,9 +10,25 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
     pub stream_options: Option<StreamOptions>,
-    /// Function-calling tools. The CLI cannot call tools that live in the
-    /// client, so these are ignored (and logged).
-    pub tools: Option<Value>,
+    /// Function tools the client can run.
+    pub tools: Option<Vec<ToolSpec>>,
+    /// `"none"` hides the tools from the model; other values are not enforced.
+    pub tool_choice: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToolSpec {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: Option<FunctionSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FunctionSpec {
+    pub name: String,
+    pub description: Option<String>,
+    /// JSON Schema of the arguments.
+    pub parameters: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +41,24 @@ pub struct StreamOptions {
 pub struct Message {
     pub role: String,
     pub content: Option<MessageContent>,
+    /// On assistant messages: tools the model called.
+    pub tool_calls: Option<Vec<MessageToolCall>>,
+    /// On `tool` messages: the call this result answers.
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MessageToolCall {
+    pub id: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    /// A JSON string per the spec; some clients send the object itself.
+    #[serde(default)]
+    pub arguments: Value,
 }
 
 /// Message content is a plain string or an array of parts.
@@ -81,7 +115,25 @@ pub struct Choice {
 #[derive(Debug, Serialize)]
 pub struct ResponseMessage {
     pub role: String,
-    pub content: String,
+    /// `null` when the model only called tools.
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ResponseFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseFunction {
+    pub name: String,
+    /// The arguments as a JSON string.
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -123,6 +175,18 @@ pub struct ChunkDelta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+/// A tool call in a stream chunk; this proxy sends each one whole.
+#[derive(Debug, Serialize)]
+pub struct ChunkToolCall {
+    pub index: u32,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ResponseFunction,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,12 +239,30 @@ mod tests {
     #[test]
     fn stream_options_and_tools() {
         let req: ChatCompletionRequest = serde_json::from_str(
-            r#"{"messages":[],"stream":true,"stream_options":{"include_usage":true},"tools":[{"type":"function"}]}"#,
+            r#"{"messages":[],"stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto",
+                "tools":[{"type":"function","function":{"name":"read_file","description":"Read","parameters":{"type":"object"}}}]}"#,
         )
         .unwrap();
         assert!(req.stream);
         assert!(req.stream_options.unwrap().include_usage);
-        assert!(req.tools.is_some());
+        let tools = req.tools.unwrap();
+        assert_eq!(tools[0].function.as_ref().unwrap().name, "read_file");
+        assert_eq!(req.tool_choice.unwrap(), "auto");
+    }
+
+    #[test]
+    fn tool_calls_and_tool_messages() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"fn main() {}"}
+            ]}"#,
+        )
+        .unwrap();
+        let messages = req.messages.unwrap();
+        let call = &messages[0].tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.function.arguments, "{\"path\":\"a.rs\"}");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
     }
 
     #[test]
@@ -201,6 +283,22 @@ mod tests {
             usage: None,
         };
         assert!(serde_json::to_value(&chunk).unwrap().get("usage").is_none());
+    }
+
+    #[test]
+    fn tool_only_message_has_null_content() {
+        let message = ResponseMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ResponseToolCall {
+                id: "toolu_1".into(),
+                call_type: "function".into(),
+                function: ResponseFunction { name: "read_file".into(), arguments: "{}".into() },
+            }]),
+        };
+        let v = serde_json::to_value(&message).unwrap();
+        assert!(v["content"].is_null());
+        assert_eq!(v["tool_calls"][0]["type"], "function");
     }
 
     #[test]

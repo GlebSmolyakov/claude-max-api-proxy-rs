@@ -1,7 +1,9 @@
 //! OpenAI chat request → `Conversation`.
 
-use crate::conversation::{Block, Conversation, ConversationBuilder, ImageSource, Role};
-use crate::types::openai::{ChatCompletionRequest, MessageContent};
+use serde_json::{Value, json};
+
+use crate::conversation::{Block, Conversation, ConversationBuilder, ImageSource, Role, ToolCall, ToolDef};
+use crate::types::openai::{ChatCompletionRequest, MessageContent, ToolSpec};
 
 pub fn to_conversation(request: &ChatCompletionRequest) -> Result<Conversation, String> {
     let messages = request
@@ -11,6 +13,11 @@ pub fn to_conversation(request: &ChatCompletionRequest) -> Result<Conversation, 
         .ok_or("messages is required and must be a non-empty array")?;
 
     let mut builder = ConversationBuilder::new();
+    let tools_off = request.tool_choice.as_ref().and_then(Value::as_str) == Some("none");
+    if let (Some(tools), false) = (&request.tools, tools_off) {
+        builder.tools(tool_defs(tools));
+    }
+
     for message in messages {
         let role = message.role.as_str();
         match role {
@@ -20,15 +27,61 @@ pub fn to_conversation(request: &ChatCompletionRequest) -> Result<Conversation, 
                 builder.system(&text_of(&blocks));
             }
             "assistant" => {
-                let blocks = content_blocks(message.content.as_ref(), role)?;
-                let text: Vec<Block> = blocks.into_iter().filter(|b| matches!(b, Block::Text(_))).collect();
-                builder.push(Role::Assistant, text);
+                let mut blocks: Vec<Block> = content_blocks(message.content.as_ref(), role)?
+                    .into_iter()
+                    .filter(|b| matches!(b, Block::Text(_)))
+                    .collect();
+                for call in message.tool_calls.iter().flatten() {
+                    blocks.push(Block::ToolUse(ToolCall {
+                        id: call.id.clone(),
+                        name: call.function.name.clone(),
+                        input: parse_arguments(&call.function.arguments),
+                    }));
+                }
+                builder.push(Role::Assistant, blocks);
             }
-            // `user`, and `tool`/`function` results, which read best as user text.
+            "tool" if message.tool_call_id.is_some() => {
+                let content = content_blocks(message.content.as_ref(), role)?;
+                builder.push(
+                    Role::User,
+                    vec![Block::ToolResult {
+                        tool_use_id: message.tool_call_id.clone().unwrap_or_default(),
+                        content,
+                        is_error: false,
+                    }],
+                );
+            }
+            // `user`, and the legacy `function` role, which reads best as user text.
             _ => builder.push(Role::User, content_blocks(message.content.as_ref(), role)?),
         }
     }
     builder.build()
+}
+
+fn tool_defs(tools: &[ToolSpec]) -> Vec<ToolDef> {
+    tools
+        .iter()
+        .filter(|t| t.tool_type == "function")
+        .filter_map(|t| t.function.as_ref())
+        .map(|f| ToolDef {
+            name: f.name.clone(),
+            description: f.description.clone().unwrap_or_default(),
+            input_schema: f
+                .parameters
+                .clone()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+        })
+        .collect()
+}
+
+/// Arguments arrive as a JSON string; a string that is not JSON is kept as is.
+fn parse_arguments(arguments: &Value) -> Value {
+    match arguments {
+        Value::String(s) if s.trim().is_empty() => json!({}),
+        Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+        Value::Null => json!({}),
+        other => other.clone(),
+    }
 }
 
 fn content_blocks(content: Option<&MessageContent>, role: &str) -> Result<Vec<Block>, String> {
@@ -56,7 +109,7 @@ fn text_of(blocks: &[Block]) -> String {
         .iter()
         .filter_map(|b| match b {
             Block::Text(t) => Some(t.as_str()),
-            Block::Image(_) => None,
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -93,10 +146,13 @@ mod tests {
         to_conversation(&request)
     }
 
+    const READ_FILE: &str = r#"{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}"#;
+
     #[test]
     fn simple_message() {
         let c = conversation(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
         assert_eq!(c.system, "");
+        assert!(c.tools.is_empty());
         assert_eq!(c.last().blocks, vec![Block::Text("hi".into())]);
     }
 
@@ -134,13 +190,65 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_read_as_user_text() {
+    fn tools_are_declared_unless_tool_choice_is_none() {
+        let with = conversation(&format!(r#"{{"tools":[{READ_FILE}],"messages":[{{"role":"user","content":"hi"}}]}}"#)).unwrap();
+        assert_eq!(with.tools[0].name, "read_file");
+        assert_eq!(with.tools[0].input_schema["properties"]["path"]["type"], "string");
+        let none = conversation(&format!(r#"{{"tools":[{READ_FILE}],"tool_choice":"none","messages":[{{"role":"user","content":"hi"}}]}}"#)).unwrap();
+        assert!(none.tools.is_empty());
+    }
+
+    #[test]
+    fn a_tool_without_parameters_gets_an_empty_object_schema() {
+        let c = conversation(r#"{"tools":[{"type":"function","function":{"name":"now"}}],"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
+        assert_eq!(c.tools[0].input_schema, json!({ "type": "object", "properties": {} }));
+    }
+
+    #[test]
+    fn tool_calls_and_results_become_blocks() {
         let c = conversation(
-            r#"{"messages":[{"role":"user","content":"weather?"},{"role":"assistant","content":null,"tool_calls":[{}]},{"role":"tool","content":"sunny"}]}"#,
+            r#"{"messages":[
+                {"role":"user","content":"what is in a.rs?"},
+                {"role":"assistant","content":"Let me look.","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]},
+                {"role":"tool","tool_call_id":"call_1","content":"fn main() {}"}
+            ]}"#,
         )
         .unwrap();
-        assert_eq!(c.turns().len(), 1, "the empty assistant turn drops and the user texts merge");
-        assert_eq!(c.last().blocks, vec![Block::Text("weather?".into()), Block::Text("sunny".into())]);
+        assert_eq!(
+            c.history()[1].blocks,
+            vec![
+                Block::Text("Let me look.".into()),
+                Block::ToolUse(ToolCall { id: "call_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) }),
+            ]
+        );
+        let results = c.tool_results();
+        assert_eq!(results[0].tool_use_id, "call_1");
+        assert_eq!(results[0].content, vec![Block::Text("fn main() {}".into())]);
+    }
+
+    #[test]
+    fn parallel_tool_results_share_one_turn() {
+        let c = conversation(
+            r#"{"messages":[
+                {"role":"user","content":"read both"},
+                {"role":"assistant","content":null,"tool_calls":[
+                    {"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}},
+                    {"id":"b","type":"function","function":{"name":"read_file","arguments":""}}]},
+                {"role":"tool","tool_call_id":"a","content":"1"},
+                {"role":"tool","tool_call_id":"b","content":"2"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.turns().len(), 3);
+        assert_eq!(c.tool_results().len(), 2);
+    }
+
+    #[test]
+    fn arguments_that_are_not_json_survive_as_a_string() {
+        assert_eq!(parse_arguments(&json!("{\"a\":1}")), json!({ "a": 1 }));
+        assert_eq!(parse_arguments(&json!("not json")), json!("not json"));
+        assert_eq!(parse_arguments(&json!({ "a": 1 })), json!({ "a": 1 }));
+        assert_eq!(parse_arguments(&Value::Null), json!({}));
     }
 
     #[test]

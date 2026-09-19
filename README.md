@@ -78,6 +78,16 @@ message = client.messages.create(
 print(message.content[0].text)
 ```
 
+Agents work the same way. [Goose](https://github.com/block/goose), for example, reads the address from `ANTHROPIC_HOST`, not from `ANTHROPIC_BASE_URL`:
+
+```bash
+export GOOSE_PROVIDER=anthropic GOOSE_MODEL=sonnet
+export ANTHROPIC_HOST=http://127.0.0.1:8080 ANTHROPIC_API_KEY=local
+goose session
+```
+
+As an ACP agent inside an editor, it runs as `goose acp` with the same variables.
+
 ## Endpoints
 
 | Endpoint | Method | What it returns |
@@ -85,9 +95,9 @@ print(message.content[0].text)
 | `/v1/chat/completions` | POST | OpenAI Chat Completions, whole or streamed; `stream_options.include_usage` adds a usage chunk |
 | `/v1/messages` | POST | Anthropic Messages, whole or streamed |
 | `/v1/models` | GET | The aliases and every model id a request has run on, with its context window once known |
-| `/health` | GET | Uptime, CLI version, the model each alias resolved to, subscription usage |
+| `/health` | GET | Uptime, CLI version, the model each alias resolved to, turns waiting for tool results, subscription usage |
 
-Responses carry the real model id, token counts including cache reads and writes, and the stop reason; on the OpenAI side `max_tokens` becomes `finish_reason: "length"`. Errors come in the error format of the endpoint that was called, with a status that says what happened:
+Responses carry the real model id, token counts including cache reads and writes, and the stop reason; on the OpenAI side `max_tokens` becomes `finish_reason: "length"` and `tool_use` becomes `"tool_calls"`. Errors come in the error format of the endpoint that was called, with a status that says what happened:
 
 | Status | When |
 |--------|------|
@@ -114,12 +124,15 @@ Each request runs the CLI as a bare model: no built-in tools, MCP servers, skill
 
 The system prompt from the request becomes the CLI's system prompt: OpenAI `system` and `developer` messages, Anthropic `system`. Images reach the model as images: `data:` and `http(s)` URLs in OpenAI `image_url` parts, `base64` and `url` sources in Anthropic `image` blocks. The API downloads URL images itself.
 
-Some request fields have nowhere to go:
-
-- `tools`. The CLI cannot call functions that live in the client, so the proxy ignores them and logs a warning.
-- `max_tokens`, `temperature`, `stop` and other sampling fields. The CLI sets these itself.
+`max_tokens`, `temperature`, `stop` and other sampling fields have nowhere to go: the CLI sets them itself.
 
 The CLI also puts a short fixed preamble in front of every subscription request. Without a system prompt of your own, the model may describe itself as running on the Claude Agent SDK.
+
+## Tools
+
+A request can declare tools that the client runs itself: OpenAI `tools` with `function` entries, or Anthropic `tools` with an `input_schema`. The proxy serves them to the CLI as an MCP server at `/mcp/<token>`, so the model calls them like its own. When it does, the response carries the calls (`tool_calls` with `finish_reason: "tool_calls"`, or `tool_use` blocks with `stop_reason: "tool_use"`) and the CLI process waits. The client runs the tools and sends the results the usual way, as `tool` messages or `tool_result` blocks. The proxy hands them to the waiting process, which goes on without a restart: a four-step agent task, such as read a file, edit it, show it and answer, runs on one CLI process.
+
+A process waits up to 30 minutes for tool results, then the proxy stops it. `tool_choice: "none"` (OpenAI) or `{"type": "none"}` (Anthropic) hides the tools; other `tool_choice` values are accepted but not enforced. Anthropic server tools such as web search are skipped.
 
 ## Conversations
 
@@ -140,6 +153,7 @@ The map is stored in `~/.claude-max-api/sessions.json` and survives restarts. Ev
   "cli_version": "2.1.276 (Claude Code)",
   "workdir": "/Users/you/.claude-max-api/workdir",
   "saved_sessions": 9,
+  "waiting_for_tools": 0,
   "models": { "haiku": "claude-haiku-4-5-20251001" },
   "rate_limits": {
     "status": "allowed",
@@ -178,8 +192,9 @@ src/
 ├── main.rs          startup, state directory, shutdown
 ├── server.rs        router and shared state
 ├── routes.rs        HTTP handlers and streaming
-├── conversation.rs  request turns, CLI input, history keys
-├── turn.rs          one request: resume or start fresh, relay, remember
+├── conversation.rs  request turns and tools, CLI input, history keys
+├── turn.rs          one request: resume, start fresh or continue a parked turn
+├── bridge.rs        MCP server that lends client tools to the CLI
 ├── subprocess.rs    the claude process and its NDJSON output
 ├── session.rs       history to CLI session map
 ├── models.rs        accepted model names

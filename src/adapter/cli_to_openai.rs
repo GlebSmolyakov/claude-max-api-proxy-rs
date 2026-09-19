@@ -1,15 +1,19 @@
 //! Turn results → OpenAI chat completion responses and stream chunks.
 
+use crate::conversation::ToolCall;
 use crate::error::AppError;
 use crate::status::unix_now;
 use crate::turn::{TurnEvent, TurnOutput};
 use crate::types::claude_cli::ResultUsage;
 use crate::types::openai::{
-    ChatCompletionChunk, ChatCompletionResponse, Choice, ChunkChoice, ChunkDelta, PromptTokensDetails,
-    ResponseMessage, Usage,
+    ChatCompletionChunk, ChatCompletionResponse, Choice, ChunkChoice, ChunkDelta, ChunkToolCall, PromptTokensDetails,
+    ResponseFunction, ResponseMessage, ResponseToolCall, Usage,
 };
 
 pub fn completion(output: &TurnOutput, request_id: &str) -> ChatCompletionResponse {
+    let tool_calls = (!output.tool_calls.is_empty())
+        .then(|| output.tool_calls.iter().map(response_tool_call).collect());
+    let content = (!output.text.is_empty() || tool_calls.is_none()).then(|| output.text.clone());
     ChatCompletionResponse {
         id: format!("chatcmpl-{request_id}"),
         object: "chat.completion".to_string(),
@@ -19,7 +23,8 @@ pub fn completion(output: &TurnOutput, request_id: &str) -> ChatCompletionRespon
             index: 0,
             message: ResponseMessage {
                 role: "assistant".to_string(),
-                content: output.text.clone(),
+                content,
+                tool_calls,
             },
             finish_reason: finish_reason(&output.stop_reason).to_string(),
         }],
@@ -30,6 +35,7 @@ pub fn completion(output: &TurnOutput, request_id: &str) -> ChatCompletionRespon
 /// Messages API stop reason → OpenAI finish reason.
 pub fn finish_reason(stop_reason: &str) -> &'static str {
     match stop_reason {
+        "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         "refusal" => "content_filter",
         _ => "stop",
@@ -50,13 +56,28 @@ pub fn usage(u: &ResultUsage) -> Usage {
     }
 }
 
+fn function(call: &ToolCall) -> ResponseFunction {
+    ResponseFunction {
+        name: call.name.clone(),
+        arguments: call.input.to_string(),
+    }
+}
+
+fn response_tool_call(call: &ToolCall) -> ResponseToolCall {
+    ResponseToolCall {
+        id: call.id.clone(),
+        call_type: "function".to_string(),
+        function: function(call),
+    }
+}
+
 /// Turns `TurnEvent`s into the `data:` payloads of an OpenAI SSE stream.
 pub struct OpenAiStream {
     id: String,
     created: u64,
     model: String,
     include_usage: bool,
-    sent_content: bool,
+    sent_role: bool,
     closed: bool,
 }
 
@@ -67,7 +88,7 @@ impl OpenAiStream {
             created: unix_now(),
             model: model.to_string(),
             include_usage,
-            sent_content: false,
+            sent_role: false,
             closed: false,
         }
     }
@@ -81,18 +102,33 @@ impl OpenAiStream {
                 self.model = model;
                 vec![]
             }
-            TurnEvent::Delta(text) => vec![self.content_chunk(text)],
+            TurnEvent::Delta(text) => vec![self.delta(Some(text), None)],
             TurnEvent::Finished(output) => {
                 let mut out = Vec::new();
                 self.model = output.model.clone();
-                if !self.sent_content && !output.text.is_empty() {
-                    out.push(self.content_chunk(output.text.clone()));
+                if !self.sent_role && !output.text.is_empty() {
+                    out.push(self.delta(Some(output.text.clone()), None));
                 }
-                let role = (!self.sent_content).then(|| "assistant".to_string());
+                if !output.tool_calls.is_empty() {
+                    // Each call goes whole, in one chunk: id, name and all arguments.
+                    let calls = output
+                        .tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, call)| ChunkToolCall {
+                            index: i as u32,
+                            id: call.id.clone(),
+                            call_type: "function".to_string(),
+                            function: function(call),
+                        })
+                        .collect();
+                    out.push(self.delta(None, Some(calls)));
+                }
+                let role = (!self.sent_role).then(|| "assistant".to_string());
                 out.push(self.chunk(
                     vec![ChunkChoice {
                         index: 0,
-                        delta: ChunkDelta { role, content: None },
+                        delta: ChunkDelta { role, content: None, tool_calls: None },
                         finish_reason: Some(finish_reason(&output.stop_reason).to_string()),
                     }],
                     None,
@@ -121,13 +157,13 @@ impl OpenAiStream {
         vec![error.openai_body().to_string(), "[DONE]".to_string()]
     }
 
-    fn content_chunk(&mut self, text: String) -> String {
-        let role = (!self.sent_content).then(|| "assistant".to_string());
-        self.sent_content = true;
+    fn delta(&mut self, content: Option<String>, tool_calls: Option<Vec<ChunkToolCall>>) -> String {
+        let role = (!self.sent_role).then(|| "assistant".to_string());
+        self.sent_role = true;
         self.chunk(
             vec![ChunkChoice {
                 index: 0,
-                delta: ChunkDelta { role, content: Some(text) },
+                delta: ChunkDelta { role, content, tool_calls },
                 finish_reason: None,
             }],
             None,
@@ -151,7 +187,7 @@ impl OpenAiStream {
 mod tests {
     use super::*;
     use crate::turn::TurnError;
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     fn output(text: &str) -> TurnOutput {
         TurnOutput {
@@ -164,6 +200,15 @@ mod tests {
                 cache_read_input_tokens: 100,
                 output_tokens: 7,
             },
+            tool_calls: vec![],
+        }
+    }
+
+    fn tool_step(text: &str) -> TurnOutput {
+        TurnOutput {
+            stop_reason: "tool_use".into(),
+            tool_calls: vec![ToolCall { id: "toolu_1".into(), name: "read_file".into(), input: json!({ "path": "a.rs" }) }],
+            ..output(text)
         }
     }
 
@@ -177,6 +222,7 @@ mod tests {
         assert_eq!(r["id"], "chatcmpl-abc");
         assert_eq!(r["model"], "claude-haiku-4-5-20251001");
         assert_eq!(r["choices"][0]["message"]["content"], "Hi");
+        assert!(r["choices"][0]["message"].get("tool_calls").is_none());
         assert_eq!(r["choices"][0]["finish_reason"], "stop");
         assert_eq!(r["usage"]["prompt_tokens"], 115);
         assert_eq!(r["usage"]["completion_tokens"], 7);
@@ -185,9 +231,25 @@ mod tests {
     }
 
     #[test]
+    fn completion_with_tool_calls() {
+        let r = serde_json::to_value(completion(&tool_step(""), "abc")).unwrap();
+        let message = &r["choices"][0]["message"];
+        assert!(message["content"].is_null(), "no text, so null content");
+        assert_eq!(message["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(message["tool_calls"][0]["function"]["arguments"], r#"{"path":"a.rs"}"#);
+        assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+
+        let with_text = serde_json::to_value(completion(&tool_step("Let me look."), "abc")).unwrap();
+        assert_eq!(with_text["choices"][0]["message"]["content"], "Let me look.");
+    }
+
+    #[test]
     fn finish_reasons() {
         assert_eq!(finish_reason("end_turn"), "stop");
         assert_eq!(finish_reason("stop_sequence"), "stop");
+        assert_eq!(finish_reason("tool_use"), "tool_calls");
         assert_eq!(finish_reason("max_tokens"), "length");
         assert_eq!(finish_reason("refusal"), "content_filter");
     }
@@ -209,6 +271,29 @@ mod tests {
         assert_eq!(end[1], "[DONE]");
         assert!(s.on_event(TurnEvent::Delta("late".into())).is_empty());
         assert!(s.on_end().is_empty());
+    }
+
+    #[test]
+    fn stream_with_tool_calls() {
+        let mut s = OpenAiStream::new("abc", "haiku", false);
+        s.on_event(TurnEvent::Delta("Let me look.".into()));
+        let end = s.on_event(TurnEvent::Finished(tool_step("Let me look.")));
+        assert_eq!(end.len(), 3, "tool calls, finish, [DONE]");
+        let calls = parse(&end[0]);
+        let call = &calls["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "toolu_1");
+        assert_eq!(call["function"]["arguments"], r#"{"path":"a.rs"}"#);
+        assert_eq!(parse(&end[1])["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn stream_of_only_tool_calls_opens_with_the_role() {
+        let mut s = OpenAiStream::new("abc", "haiku", false);
+        let end = s.on_event(TurnEvent::Finished(tool_step("")));
+        let calls = parse(&end[0]);
+        assert_eq!(calls["choices"][0]["delta"]["role"], "assistant");
+        assert!(calls["choices"][0]["delta"].get("content").is_none());
     }
 
     #[test]

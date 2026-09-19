@@ -1,8 +1,8 @@
 //! Provider-neutral view of a chat request.
 //!
 //! Both adapters (OpenAI and Anthropic) turn their request into a
-//! `Conversation`: one system prompt plus alternating user and assistant
-//! turns made of text and image blocks. From it the turn runner builds what
+//! `Conversation`: one system prompt, the tools the client can run, and
+//! alternating user and assistant turns. From it the turn runner builds what
 //! the CLI reads on stdin, and the session store derives the keys that tie a
 //! conversation prefix to a saved CLI session.
 
@@ -21,10 +21,35 @@ pub enum ImageSource {
     Url(String),
 }
 
+/// A tool the client declared and can run itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema of the tool's input object.
+    pub input_schema: Value,
+}
+
+/// A tool call the model made.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: Value,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Text(String),
     Image(ImageSource),
+    /// In an assistant turn: a tool call the model made.
+    ToolUse(ToolCall),
+    /// In a user turn: what the client's tool returned, as text and images.
+    ToolResult {
+        tool_use_id: String,
+        content: Vec<Block>,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,11 +58,12 @@ pub struct Turn {
     pub blocks: Vec<Block>,
 }
 
-/// A validated conversation: at least one turn, and the last turn is the
-/// user's new message.
+/// A validated conversation: at least one turn, and the last turn comes from
+/// the user (a new message, tool results, or both).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conversation {
     pub system: String,
+    pub tools: Vec<ToolDef>,
     turns: Vec<Turn>,
 }
 
@@ -47,6 +73,7 @@ pub struct Conversation {
 #[derive(Debug, Default)]
 pub struct ConversationBuilder {
     system: Vec<String>,
+    tools: Vec<ToolDef>,
     turns: Vec<Turn>,
 }
 
@@ -59,6 +86,10 @@ impl ConversationBuilder {
         if !text.trim().is_empty() {
             self.system.push(text.to_string());
         }
+    }
+
+    pub fn tools(&mut self, tools: Vec<ToolDef>) {
+        self.tools = tools;
     }
 
     pub fn push(&mut self, role: Role, blocks: Vec<Block>) {
@@ -80,6 +111,7 @@ impl ConversationBuilder {
             }
             Some(_) => Ok(Conversation {
                 system: self.system.join("\n\n"),
+                tools: self.tools,
                 turns: self.turns,
             }),
         }
@@ -88,6 +120,14 @@ impl ConversationBuilder {
 
 fn is_blank(block: &Block) -> bool {
     matches!(block, Block::Text(s) if s.trim().is_empty())
+}
+
+/// One tool result from the last user turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub tool_use_id: String,
+    pub content: Vec<Block>,
+    pub is_error: bool,
 }
 
 impl Conversation {
@@ -103,6 +143,36 @@ impl Conversation {
     /// The new user message.
     pub fn last(&self) -> &Turn {
         self.turns.last().expect("a built conversation has at least one turn")
+    }
+
+    /// Tool results the client sent in its last turn.
+    pub fn tool_results(&self) -> Vec<ToolResult> {
+        self.last()
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ToolResult { tool_use_id, content, is_error } => Some(ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Plain text the client added to its last turn next to tool results.
+    pub fn last_text(&self) -> String {
+        self.last()
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Text(t) => Some(t.trim()),
+                _ => None,
+            })
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 
     /// Key of the history, or `None` when this is the first message.
@@ -127,17 +197,18 @@ impl Conversation {
 
     /// CLI input when a saved session already holds the history: only the new message.
     pub fn continuation_input(&self) -> String {
-        cli_input_line(&self.last().blocks)
+        cli_input_line(&render(&self.last().blocks))
     }
 
     /// CLI input for a fresh session. Without history this is the message
     /// itself. With history, the earlier turns are replayed as a transcript
     /// inside one message, because the CLI cannot be handed prior assistant
-    /// turns directly. Images keep their place in the transcript.
+    /// turns directly. Images keep their place; tool calls and results
+    /// become tagged text.
     pub fn fresh_input(&self) -> String {
         let history = self.history();
         if history.is_empty() {
-            return cli_input_line(&self.last().blocks);
+            return self.continuation_input();
         }
 
         let mut blocks = Vec::new();
@@ -148,17 +219,43 @@ impl Conversation {
                 Role::Assistant => "assistant",
             };
             push_text(&mut blocks, &format!("\n<{tag}>\n"));
-            append_blocks(&mut blocks, &turn.blocks);
+            append_rendered(&mut blocks, &turn.blocks);
             push_text(&mut blocks, &format!("\n</{tag}>"));
         }
         push_text(&mut blocks, "\n</conversation_history>\n\nReply to the latest user message:\n\n");
-        append_blocks(&mut blocks, &self.last().blocks);
+        append_rendered(&mut blocks, &self.last().blocks);
         cli_input_line(&blocks)
     }
 }
 
-/// Append text to the last block when it is text, so the transcript stays
-/// one text block between images.
+/// Text and image blocks for the CLI, with tool blocks written out as tagged text.
+fn render(blocks: &[Block]) -> Vec<Block> {
+    let mut out = Vec::new();
+    append_rendered(&mut out, blocks);
+    out
+}
+
+fn append_rendered(out: &mut Vec<Block>, blocks: &[Block]) {
+    for block in blocks {
+        match block {
+            Block::Text(s) => push_text(out, s),
+            Block::Image(_) => out.push(block.clone()),
+            Block::ToolUse(call) => push_text(
+                out,
+                &format!("\n<tool_call name=\"{}\" id=\"{}\">{}</tool_call>", call.name, call.id, call.input),
+            ),
+            Block::ToolResult { tool_use_id, content, is_error } => {
+                let error = if *is_error { " error=\"true\"" } else { "" };
+                push_text(out, &format!("\n<tool_result id=\"{tool_use_id}\"{error}>\n"));
+                append_rendered(out, content);
+                push_text(out, "\n</tool_result>");
+            }
+        }
+    }
+}
+
+/// Append text to the last block when it is text, so text runs stay one
+/// block between images.
 fn push_text(blocks: &mut Vec<Block>, text: &str) {
     if let Some(Block::Text(prev)) = blocks.last_mut() {
         prev.push_str(text);
@@ -167,18 +264,10 @@ fn push_text(blocks: &mut Vec<Block>, text: &str) {
     }
 }
 
-fn append_blocks(blocks: &mut Vec<Block>, from: &[Block]) {
-    for block in from {
-        match block {
-            Block::Text(s) => push_text(blocks, s),
-            Block::Image(_) => blocks.push(block.clone()),
-        }
-    }
-}
-
-/// One NDJSON line for `claude --input-format stream-json`.
+/// One NDJSON line for `claude --input-format stream-json`. Expects rendered
+/// blocks: text and images only.
 fn cli_input_line(blocks: &[Block]) -> String {
-    let content: Vec<Value> = blocks.iter().map(block_json).collect();
+    let content: Vec<Value> = blocks.iter().filter_map(block_json).collect();
     let line = json!({
         "type": "user",
         "message": { "role": "user", "content": content },
@@ -186,8 +275,8 @@ fn cli_input_line(blocks: &[Block]) -> String {
     format!("{line}\n")
 }
 
-fn block_json(block: &Block) -> Value {
-    match block {
+fn block_json(block: &Block) -> Option<Value> {
+    Some(match block {
         Block::Text(text) => json!({ "type": "text", "text": text }),
         Block::Image(ImageSource::Base64 { media_type, data }) => json!({
             "type": "image",
@@ -197,12 +286,13 @@ fn block_json(block: &Block) -> Value {
             "type": "image",
             "source": { "type": "url", "url": url },
         }),
-    }
+        Block::ToolUse(_) | Block::ToolResult { .. } => return None,
+    })
 }
 
 /// Hash of a system prompt plus turns. Text is trimmed and assistant turns
-/// are reduced to their text, so a client that strips whitespace from a reply
-/// or wraps it differently still lands on the same key.
+/// are reduced to their text and tool calls, so a client that strips
+/// whitespace from a reply or wraps it differently still lands on the same key.
 fn key_of<'a>(system: &str, turns: impl Iterator<Item = &'a Turn>) -> String {
     let turns: Vec<Value> = turns.map(canonical_turn).collect();
     // serde_json maps are ordered, so the serialization is stable.
@@ -218,26 +308,42 @@ fn canonical_turn(turn: &Turn) -> Value {
                 .iter()
                 .filter_map(|b| match b {
                     Block::Text(s) => Some(s.as_str()),
-                    Block::Image(_) => None,
+                    _ => None,
                 })
                 .collect();
-            json!({ "assistant": text.trim() })
-        }
-        Role::User => {
-            let blocks: Vec<Value> = turn
+            let calls: Vec<Value> = turn
                 .blocks
                 .iter()
-                .map(|b| match b {
-                    Block::Text(s) => json!({ "text": s.trim() }),
-                    Block::Image(ImageSource::Base64 { data, .. }) => {
-                        json!({ "image": hex_digest(data.as_bytes()) })
-                    }
-                    Block::Image(ImageSource::Url(url)) => json!({ "image_url": url }),
+                .filter_map(|b| match b {
+                    Block::ToolUse(c) => Some(json!({ "id": c.id, "name": c.name, "input": c.input })),
+                    _ => None,
                 })
                 .collect();
-            json!({ "user": blocks })
+            if calls.is_empty() {
+                json!({ "assistant": text.trim() })
+            } else {
+                json!({ "assistant": text.trim(), "tool_calls": calls })
+            }
         }
+        Role::User => json!({ "user": canonical_blocks(&turn.blocks) }),
     }
+}
+
+fn canonical_blocks(blocks: &[Block]) -> Vec<Value> {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Text(s) => json!({ "text": s.trim() }),
+            Block::Image(ImageSource::Base64 { data, .. }) => json!({ "image": hex_digest(data.as_bytes()) }),
+            Block::Image(ImageSource::Url(url)) => json!({ "image_url": url }),
+            Block::ToolUse(c) => json!({ "tool_call": c.id }),
+            Block::ToolResult { tool_use_id, content, is_error } => json!({
+                "tool_result": tool_use_id,
+                "error": is_error,
+                "content": canonical_blocks(content),
+            }),
+        })
+        .collect()
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -264,6 +370,14 @@ mod tests {
         b.build().unwrap()
     }
 
+    fn call(id: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: "read_file".into(), input: json!({ "path": "main.rs" }) }
+    }
+
+    fn result(id: &str, out: &str) -> Block {
+        Block::ToolResult { tool_use_id: id.into(), content: vec![text(out)], is_error: false }
+    }
+
     fn parse_line(line: &str) -> Value {
         assert!(line.ends_with('\n'));
         serde_json::from_str(line.trim_end()).unwrap()
@@ -285,8 +399,7 @@ mod tests {
         b.push(Role::User, vec![text("hi")]);
         b.push(Role::Assistant, vec![text("   ")]);
         b.push(Role::User, vec![text("again")]);
-        let c = b.build().unwrap();
-        assert_eq!(c.turns().len(), 1, "the blank assistant turn disappears and the users merge");
+        assert_eq!(b.build().unwrap().turns().len(), 1, "the blank assistant turn disappears and the users merge");
     }
 
     #[test]
@@ -299,13 +412,16 @@ mod tests {
     }
 
     #[test]
-    fn builder_joins_system_parts() {
+    fn builder_joins_system_parts_and_keeps_tools() {
         let mut b = ConversationBuilder::new();
         b.system("one");
         b.system("  ");
         b.system("two");
+        b.tools(vec![ToolDef { name: "t".into(), description: String::new(), input_schema: json!({}) }]);
         b.push(Role::User, vec![text("hi")]);
-        assert_eq!(b.build().unwrap().system, "one\n\ntwo");
+        let c = b.build().unwrap();
+        assert_eq!(c.system, "one\n\ntwo");
+        assert_eq!(c.tools.len(), 1);
     }
 
     #[test]
@@ -322,6 +438,32 @@ mod tests {
             &[(Role::User, "hi"), (Role::Assistant, "Hello!"), (Role::User, "how are you?")],
         );
         assert_eq!(second.history_key(), Some(stored));
+    }
+
+    #[test]
+    fn key_after_a_tool_loop_matches_the_next_request() {
+        let mut b = ConversationBuilder::new();
+        b.push(Role::User, vec![text("what is in main.rs?")]);
+        b.push(Role::Assistant, vec![text("Let me look."), Block::ToolUse(call("t1"))]);
+        b.push(Role::User, vec![result("t1", "fn main() {}")]);
+        let after_tools = b.build().unwrap();
+        let stored = after_tools.key_after_reply("An empty main.");
+
+        let mut b = ConversationBuilder::new();
+        b.push(Role::User, vec![text("what is in main.rs?")]);
+        b.push(Role::Assistant, vec![text("Let me look."), Block::ToolUse(call("t1"))]);
+        b.push(Role::User, vec![result("t1", "fn main() {}")]);
+        b.push(Role::Assistant, vec![text("An empty main.")]);
+        b.push(Role::User, vec![text("thanks")]);
+        assert_eq!(b.build().unwrap().history_key(), Some(stored));
+    }
+
+    #[test]
+    fn plain_keys_do_not_change_with_tool_support() {
+        // A key without tool calls is the same document as before tools existed.
+        let c = conversation("", &[(Role::User, "hi")]);
+        let doc = json!({ "v": 1, "system": "", "turns": [{ "user": [{ "text": "hi" }] }, { "assistant": "yo" }] });
+        assert_eq!(c.key_after_reply("yo"), hex_digest(doc.to_string().as_bytes()));
     }
 
     #[test]
@@ -351,15 +493,24 @@ mod tests {
                 Role::User,
                 vec![
                     text("what is this?"),
-                    Block::Image(ImageSource::Base64 {
-                        media_type: "image/png".into(),
-                        data: data.into(),
-                    }),
+                    Block::Image(ImageSource::Base64 { media_type: "image/png".into(), data: data.into() }),
                 ],
             );
             b.build().unwrap().key_after_reply("a square")
         };
         assert_ne!(with_image("AAAA"), with_image("BBBB"));
+    }
+
+    #[test]
+    fn tool_results_and_extra_text_of_the_last_turn() {
+        let mut b = ConversationBuilder::new();
+        b.push(Role::User, vec![text("go")]);
+        b.push(Role::Assistant, vec![Block::ToolUse(call("t1")), Block::ToolUse(call("t2"))]);
+        b.push(Role::User, vec![result("t1", "a"), result("t2", "b"), text("also, hurry")]);
+        let c = b.build().unwrap();
+        let ids: Vec<String> = c.tool_results().into_iter().map(|r| r.tool_use_id).collect();
+        assert_eq!(ids, ["t1", "t2"]);
+        assert_eq!(c.last_text(), "also, hurry");
     }
 
     #[test]
@@ -381,19 +532,32 @@ mod tests {
     fn fresh_input_replays_history_with_images_in_place() {
         let image = Block::Image(ImageSource::Url("https://example.com/cat.png".into()));
         let mut b = ConversationBuilder::new();
-        b.push(Role::User, vec![text("look"), image.clone()]);
+        b.push(Role::User, vec![text("look"), image]);
         b.push(Role::Assistant, vec![text("a cat")]);
         b.push(Role::User, vec![text("what color?")]);
         let line = parse_line(&b.build().unwrap().fresh_input());
         let content = line["message"]["content"].as_array().unwrap();
 
         assert_eq!(content.len(), 3, "text, image, text");
-        let before = content[0]["text"].as_str().unwrap();
-        assert!(before.contains("<conversation_history>\n<user>\nlook"));
+        assert!(content[0]["text"].as_str().unwrap().contains("<conversation_history>\n<user>\nlook"));
         assert_eq!(content[1]["source"]["url"], "https://example.com/cat.png");
         let after = content[2]["text"].as_str().unwrap();
         assert!(after.contains("<assistant>\na cat\n</assistant>"));
         assert!(after.ends_with("Reply to the latest user message:\n\nwhat color?"));
+    }
+
+    #[test]
+    fn fresh_input_writes_tool_calls_and_results_as_text() {
+        let mut b = ConversationBuilder::new();
+        b.push(Role::User, vec![text("what is in main.rs?")]);
+        b.push(Role::Assistant, vec![Block::ToolUse(call("t1"))]);
+        b.push(Role::User, vec![result("t1", "fn main() {}")]);
+        let line = parse_line(&b.build().unwrap().fresh_input());
+        let content = line["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "everything is text");
+        let t = content[0]["text"].as_str().unwrap();
+        assert!(t.contains(r#"<tool_call name="read_file" id="t1">{"path":"main.rs"}</tool_call>"#), "{t}");
+        assert!(t.ends_with("<tool_result id=\"t1\">\nfn main() {}\n</tool_result>"), "{t}");
     }
 
     #[test]
@@ -404,7 +568,7 @@ mod tests {
         }));
         assert_eq!(
             block,
-            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } })
+            Some(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "QUJD" } }))
         );
     }
 }

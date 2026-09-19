@@ -1,15 +1,25 @@
 //! One chat turn from start to finish: continue a saved session or start a
 //! fresh one, run the CLI, relay what it says, and remember the session for
 //! the next turn. Routes only format the resulting `TurnEvent`s.
+//!
+//! A turn with client tools can span several HTTP requests. When the model
+//! calls a tool, the turn answers the current request with the call and
+//! parks: the CLI process stays alive, waiting in the MCP bridge. The
+//! client's next request carries the result, finds the parked turn by the
+//! tool call id, and the same process goes on.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::conversation::Conversation;
+use crate::bridge::{Bridge, ToolOutcome};
+use crate::conversation::{Block, Conversation, ToolCall, ToolResult};
 use crate::server::AppState;
 use crate::session::SessionStore;
 use crate::status::RuntimeStatus;
-use crate::subprocess::{self, SubprocessEvent, SubprocessOptions};
+use crate::subprocess::{self, INACTIVITY_TIMEOUT, Process, SubprocessEvent, SubprocessOptions};
 use crate::types::claude_cli::{ResultMessage, ResultUsage};
 
 #[derive(Debug)]
@@ -25,9 +35,12 @@ pub enum TurnEvent {
 pub struct TurnOutput {
     pub text: String,
     pub model: String,
-    /// Messages API stop reason: `end_turn`, `max_tokens`, `refusal`, …
+    /// Messages API stop reason: `end_turn`, `tool_use`, `max_tokens`, …
     pub stop_reason: String,
+    /// Tokens of this step: one API call.
     pub usage: ResultUsage,
+    /// Tools the client should run, when `stop_reason` is `tool_use`.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,15 +68,27 @@ pub fn start(state: &AppState, request: TurnRequest) -> mpsc::Receiver<TurnEvent
 
 async fn drive(state: AppState, request: TurnRequest, tx: mpsc::Sender<TurnEvent>) {
     let rid = &request.request_id;
+
+    let results = request.conversation.tool_results();
+    if let Some(first) = results.first() {
+        if let Some(parked) = state.pending.take(&first.tool_use_id) {
+            continue_parked(&state, &request, parked, &results, &tx).await;
+            return;
+        }
+        info!("[req={rid}] Tool results for a turn this proxy no longer holds, replaying the history");
+    }
+
     let mut resume = match request.conversation.history_key() {
         Some(key) => state.sessions.lookup(&key).await,
         None => None,
     };
-    if request.conversation.history_key().is_some() && resume.is_none() {
+    if request.conversation.history_key().is_some() && resume.is_none() && results.is_empty() {
         info!("[req={rid}] History not seen before, replaying it into a fresh session");
     }
 
     loop {
+        let bridge = (!request.conversation.tools.is_empty())
+            .then(|| state.bridges.register(request.conversation.tools.clone()));
         let input = match resume {
             Some(_) => request.conversation.continuation_input(),
             None => request.conversation.fresh_input(),
@@ -73,50 +98,136 @@ async fn drive(state: AppState, request: TurnRequest, tx: mpsc::Sender<TurnEvent
             model: request.model.clone(),
             system_prompt: request.conversation.system.clone(),
             resume: resume.clone(),
+            mcp_url: bridge.as_ref().map(|(token, _)| format!("{}/{token}", state.mcp_base)),
             cwd: state.cwd.clone(),
             api: request.api,
         };
-        let (process_tx, process_rx) = mpsc::channel(64);
-        tokio::spawn(subprocess::spawn_subprocess(input, options, process_tx));
+        let process = subprocess::spawn(input, options);
 
-        let resuming = resume.is_some();
-        match relay(&state.sessions, &state.status, &request, resuming, process_rx, &tx).await {
-            Relay::Done => return,
-            Relay::ResumeFailed => {
+        let ctx = RelayCtx {
+            sessions: &state.sessions,
+            status: &state.status,
+            request: &request,
+            bridge: bridge.as_ref().map(|(_, b)| b.as_ref()),
+            resuming: resume.is_some(),
+            started: false,
+            model: request.model.clone(),
+        };
+        let outcome = relay(ctx, process, &tx).await;
+        match (outcome, bridge) {
+            (Relay::Parked { process, tool_ids, model }, Some((token, bridge))) => {
+                info!("[req={rid}] Waiting for the client to run {} tool call(s)", tool_ids.len());
+                state.pending.park(Parked { process, token, bridge, model, tool_ids, since: Instant::now() });
+                return;
+            }
+            (Relay::ResumeFailed, bridge) => {
+                if let Some((token, _)) = bridge {
+                    state.bridges.remove(&token);
+                }
                 warn!("[req={rid}] Saved session could not be resumed, replaying the history instead");
                 resume = None;
+            }
+            (_, bridge) => {
+                if let Some((token, _)) = bridge {
+                    state.bridges.remove(&token);
+                }
+                return;
             }
         }
     }
 }
 
-#[derive(Debug, PartialEq)]
+/// Hand the client's tool results to the parked process and relay what the
+/// model does next.
+async fn continue_parked(
+    state: &AppState,
+    request: &TurnRequest,
+    parked: Parked,
+    results: &[ToolResult],
+    tx: &mpsc::Sender<TurnEvent>,
+) {
+    let rid = &request.request_id;
+    info!("[req={rid}] Continuing a parked turn with {} tool result(s)", results.len());
+
+    // Text the user added next to the results cannot become a new message
+    // in the middle of a turn, so it rides along with the last result.
+    let note = request.conversation.last_text();
+    let mut delivered = HashSet::new();
+    for (i, result) in results.iter().enumerate() {
+        let mut content = result.content.clone();
+        if i + 1 == results.len() && !note.is_empty() {
+            content.push(Block::Text(format!("\n\n[The user also wrote]\n{note}")));
+        }
+        parked.bridge.deliver(&result.tool_use_id, ToolOutcome { content, is_error: result.is_error });
+        delivered.insert(result.tool_use_id.clone());
+    }
+    for id in parked.tool_ids.iter().filter(|id| !delivered.contains(*id)) {
+        warn!("[req={rid}] The client sent no result for tool call {id}");
+        let content = vec![Block::Text("The client returned no result for this call.".to_string())];
+        parked.bridge.deliver(id, ToolOutcome { content, is_error: true });
+    }
+
+    let Parked { process, token, bridge, model, .. } = parked;
+    if tx.send(TurnEvent::Started { model: model.clone() }).await.is_err() {
+        state.bridges.remove(&token);
+        return;
+    }
+    let ctx = RelayCtx {
+        sessions: &state.sessions,
+        status: &state.status,
+        request,
+        bridge: Some(&bridge),
+        resuming: false,
+        started: true,
+        model,
+    };
+    match relay(ctx, process, tx).await {
+        Relay::Parked { process, tool_ids, model } => {
+            info!("[req={rid}] Waiting for the client to run {} tool call(s)", tool_ids.len());
+            state.pending.park(Parked { process, token, bridge, model, tool_ids, since: Instant::now() });
+        }
+        _ => state.bridges.remove(&token),
+    }
+}
+
+struct RelayCtx<'a> {
+    sessions: &'a SessionStore,
+    status: &'a RuntimeStatus,
+    request: &'a TurnRequest,
+    /// Present when the client declared tools.
+    bridge: Option<&'a Bridge>,
+    resuming: bool,
+    /// `Started` was already sent (a continued turn).
+    started: bool,
+    model: String,
+}
+
 enum Relay {
     Done,
     /// The saved session is gone; nothing reached the client yet.
     ResumeFailed,
+    /// The model called client tools; the process waits for their results.
+    Parked { process: Process, tool_ids: Vec<String>, model: String },
 }
 
-async fn relay(
-    sessions: &SessionStore,
-    status: &RuntimeStatus,
-    request: &TurnRequest,
-    resuming: bool,
-    mut events: mpsc::Receiver<SubprocessEvent>,
-    tx: &mpsc::Sender<TurnEvent>,
-) -> Relay {
-    let mut model = request.model.clone();
-    let mut started = false;
+async fn relay(ctx: RelayCtx<'_>, mut process: Process, tx: &mpsc::Sender<TurnEvent>) -> Relay {
+    let mut model = ctx.model;
+    let mut started = ctx.started;
     let mut streamed = String::new();
     let mut answered = false;
     let mut limit_rejected = false;
+    let mut step_usage: Option<ResultUsage> = None;
+    // Tool calls of the current step: announced ids, and complete calls.
+    let mut announced: Vec<String> = Vec::new();
+    let mut calls: Vec<ToolCall> = Vec::new();
+    let mut tool_step_ended = false;
 
-    while let Some(event) = events.recv().await {
+    while let Some(event) = process.events.recv().await {
         match event {
             SubprocessEvent::Init { session_id, model: resolved } => {
-                info!("[req={}] Session {session_id} on {resolved}", request.request_id);
+                info!("[req={}] Session {session_id} on {resolved}", ctx.request.request_id);
                 if !resolved.is_empty() {
-                    status.record_model(&request.model, &resolved);
+                    ctx.status.record_model(&ctx.request.model, &resolved);
                     model = resolved;
                 }
                 started = true;
@@ -130,16 +241,29 @@ async fn relay(
                     return Relay::Done;
                 }
             }
+            SubprocessEvent::ToolUseStarted(id) => announced.push(id),
+            SubprocessEvent::ToolUse(mut call) => {
+                if let Some(bridge) = ctx.bridge {
+                    call.name = bridge.client_name(&call.name);
+                }
+                calls.push(call);
+            }
+            SubprocessEvent::StepEnd { stop_reason, usage } => {
+                if usage.is_some() {
+                    step_usage = usage;
+                }
+                tool_step_ended = ctx.bridge.is_some() && stop_reason.as_deref() == Some("tool_use");
+            }
             SubprocessEvent::RateLimit(info) => {
                 limit_rejected = info.status.as_deref().is_some_and(|s| s != "allowed");
-                status.record_rate_limit(&info);
+                ctx.status.record_rate_limit(&info);
             }
             SubprocessEvent::Result(result) => {
                 if let Some(usage) = &result.model_usage {
-                    status.record_model_usage(usage);
+                    ctx.status.record_model_usage(usage);
                 }
                 if result.is_error {
-                    if resuming && !started {
+                    if ctx.resuming && !started {
                         return Relay::ResumeFailed;
                     }
                     let _ = tx.send(TurnEvent::Failed(error_from_result(&result, limit_rejected))).await;
@@ -148,10 +272,11 @@ async fn relay(
                         text: result.result.clone().unwrap_or_else(|| streamed.clone()),
                         model: model.clone(),
                         stop_reason: result.stop_reason.clone().unwrap_or_else(|| "end_turn".to_string()),
-                        usage: result.usage.unwrap_or_default(),
+                        usage: step_usage.or(result.usage).unwrap_or_default(),
+                        tool_calls: Vec::new(),
                     };
                     if let Some(session_id) = result.session_id.as_ref().filter(|s| !s.is_empty()) {
-                        remember(sessions, &request.conversation, &output.text, &streamed, session_id).await;
+                        remember(ctx.sessions, &ctx.request.conversation, &output.text, &streamed, session_id).await;
                     }
                     let _ = tx.send(TurnEvent::Finished(output)).await;
                 }
@@ -175,7 +300,7 @@ async fn relay(
             }
             SubprocessEvent::Close { code, stderr_tail } => {
                 if !answered {
-                    if resuming && !started {
+                    if ctx.resuming && !started {
                         return Relay::ResumeFailed;
                     }
                     let mut message = format!("claude exited with code {code} without a result");
@@ -187,6 +312,26 @@ async fn relay(
                 }
                 return Relay::Done;
             }
+        }
+
+        // A tool step is complete once the step has ended and every
+        // announced call has arrived with its input.
+        let complete = tool_step_ended
+            && !calls.is_empty()
+            && announced.iter().all(|id| calls.iter().any(|c| &c.id == id));
+        if complete {
+            let output = TurnOutput {
+                text: std::mem::take(&mut streamed),
+                model: model.clone(),
+                stop_reason: "tool_use".to_string(),
+                usage: step_usage.unwrap_or_default(),
+                tool_calls: calls.clone(),
+            };
+            if tx.send(TurnEvent::Finished(output)).await.is_err() {
+                return Relay::Done;
+            }
+            let tool_ids = calls.into_iter().map(|c| c.id).collect();
+            return Relay::Parked { process, tool_ids, model };
         }
     }
     Relay::Done
@@ -225,12 +370,98 @@ fn error_from_result(result: &ResultMessage, limit_rejected: bool) -> TurnError 
     TurnError { status, message }
 }
 
+// ── Parked turns ────────────────────────────────────────────────
+
+/// A turn waiting for the client to run tools. Dropping it kills the process.
+pub struct Parked {
+    process: Process,
+    token: String,
+    bridge: Arc<Bridge>,
+    model: String,
+    tool_ids: Vec<String>,
+    since: Instant,
+}
+
+#[derive(Default)]
+pub struct PendingTurns {
+    inner: Mutex<PendingInner>,
+}
+
+#[derive(Default)]
+struct PendingInner {
+    by_tool: HashMap<String, u64>,
+    turns: HashMap<u64, Parked>,
+    next: u64,
+}
+
+impl PendingTurns {
+    fn park(&self, parked: Parked) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.next += 1;
+        let key = inner.next;
+        for id in &parked.tool_ids {
+            inner.by_tool.insert(id.clone(), key);
+        }
+        inner.turns.insert(key, parked);
+    }
+
+    /// The turn waiting for `tool_use_id`, removed from the list.
+    fn take(&self, tool_use_id: &str) -> Option<Parked> {
+        let mut inner = self.inner.lock().unwrap();
+        let key = inner.by_tool.get(tool_use_id).copied()?;
+        let parked = inner.turns.remove(&key)?;
+        for id in &parked.tool_ids {
+            inner.by_tool.remove(id);
+        }
+        Some(parked)
+    }
+
+    fn expire(&self, max_age: Duration) -> Vec<Parked> {
+        let mut inner = self.inner.lock().unwrap();
+        let old: Vec<u64> = inner
+            .turns
+            .iter()
+            .filter(|(_, p)| p.since.elapsed() >= max_age)
+            .map(|(k, _)| *k)
+            .collect();
+        let mut expired = Vec::new();
+        for key in old {
+            if let Some(parked) = inner.turns.remove(&key) {
+                for id in &parked.tool_ids {
+                    inner.by_tool.remove(id);
+                }
+                expired.push(parked);
+            }
+        }
+        expired
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().turns.len()
+    }
+}
+
+/// Every minute, kill turns that waited for tool results longer than the
+/// CLI would wait for them anyway.
+pub fn spawn_expiry_task(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            for parked in state.pending.expire(INACTIVITY_TIMEOUT) {
+                warn!("Dropping a turn that waited {:.0}s for tool results", parked.since.elapsed().as_secs_f64());
+                state.bridges.remove(&parked.token);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{Block, ConversationBuilder, Role};
+    use crate::conversation::{ConversationBuilder, Role, ToolDef};
     use crate::types::claude_cli::RateLimitInfo;
-    use std::collections::HashMap;
+    use serde_json::json;
 
     fn request(turns: &[(Role, &str)]) -> TurnRequest {
         let mut b = ConversationBuilder::new();
@@ -256,20 +487,33 @@ mod tests {
     }
 
     fn init() -> SubprocessEvent {
-        SubprocessEvent::Init {
-            session_id: "s".into(),
-            model: "claude-haiku-4-5-20251001".into(),
-        }
+        SubprocessEvent::Init { session_id: "s".into(), model: "claude-haiku-4-5-20251001".into() }
     }
 
     fn close(code: i32) -> SubprocessEvent {
         SubprocessEvent::Close { code, stderr_tail: String::new() }
     }
 
+    fn tool_use(id: &str) -> SubprocessEvent {
+        SubprocessEvent::ToolUse(ToolCall { id: id.into(), name: "mcp__c__read_file".into(), input: json!({ "path": "a.rs" }) })
+    }
+
+    fn step_end(reason: &str) -> SubprocessEvent {
+        SubprocessEvent::StepEnd {
+            stop_reason: Some(reason.into()),
+            usage: Some(ResultUsage { input_tokens: 100, output_tokens: 20, ..ResultUsage::default() }),
+        }
+    }
+
+    fn tools_bridge() -> Bridge {
+        Bridge::new(vec![ToolDef { name: "read_file".into(), description: String::new(), input_schema: json!({}) }])
+    }
+
     /// Feed `events` through `relay` and collect what the route would see.
     async fn run(
         req: &TurnRequest,
         store: &SessionStore,
+        bridge: Option<&Bridge>,
         resuming: bool,
         events: Vec<SubprocessEvent>,
     ) -> (Relay, Vec<TurnEvent>) {
@@ -280,7 +524,16 @@ mod tests {
         }
         drop(ptx);
         let (tx, mut rx) = mpsc::channel(64);
-        let outcome = relay(store, &status, req, resuming, prx, &tx).await;
+        let ctx = RelayCtx {
+            sessions: store,
+            status: &status,
+            request: req,
+            bridge,
+            resuming,
+            started: false,
+            model: req.model.clone(),
+        };
+        let outcome = relay(ctx, Process::from_events(prx), &tx).await;
         drop(tx);
         let mut out = Vec::new();
         while let Some(e) = rx.recv().await {
@@ -293,21 +546,22 @@ mod tests {
     async fn success_streams_and_remembers_the_session() {
         let req = request(&[(Role::User, "hi")]);
         let store = sessions().await;
-        let (outcome, events) = run(&req, &store, false, vec![
+        let (outcome, events) = run(&req, &store, None, false, vec![
             init(),
             SubprocessEvent::TextDelta("Hel".into()),
             SubprocessEvent::TextDelta("lo".into()),
-            result(r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello","session_id":"sid-2","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2}}"#),
+            step_end("end_turn"),
+            result(r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello","session_id":"sid-2","stop_reason":"end_turn","usage":{"input_tokens":999,"output_tokens":999}}"#),
             close(0),
         ]).await;
 
-        assert_eq!(outcome, Relay::Done);
+        assert!(matches!(outcome, Relay::Done));
         assert!(matches!(&events[0], TurnEvent::Started { model } if model == "claude-haiku-4-5-20251001"));
         assert!(matches!(&events[1], TurnEvent::Delta(t) if t == "Hel"));
         let TurnEvent::Finished(output) = &events[3] else { panic!("{events:?}") };
         assert_eq!(output.text, "Hello");
-        assert_eq!(output.model, "claude-haiku-4-5-20251001");
-        assert_eq!(output.usage.input_tokens, 10);
+        assert_eq!(output.usage.input_tokens, 100, "the step's usage, not the run's total");
+        assert!(output.tool_calls.is_empty());
         assert_eq!(events.len(), 4);
 
         let next = request(&[(Role::User, "hi"), (Role::Assistant, "Hello"), (Role::User, "more")]);
@@ -316,31 +570,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tool_step_answers_with_the_calls_and_parks() {
+        let req = request(&[(Role::User, "what is in a.rs?")]);
+        let bridge = tools_bridge();
+        let (outcome, events) = run(&req, &sessions().await, Some(&bridge), false, vec![
+            init(),
+            SubprocessEvent::TextDelta("Let me look.".into()),
+            SubprocessEvent::ToolUseStarted("toolu_1".into()),
+            tool_use("toolu_1"),
+            step_end("tool_use"),
+        ]).await;
+
+        let Relay::Parked { tool_ids, model, .. } = outcome else { panic!("not parked") };
+        assert_eq!(tool_ids, ["toolu_1"]);
+        assert_eq!(model, "claude-haiku-4-5-20251001");
+        let TurnEvent::Finished(output) = events.last().unwrap() else { panic!("{events:?}") };
+        assert_eq!(output.stop_reason, "tool_use");
+        assert_eq!(output.text, "Let me look.");
+        assert_eq!(output.tool_calls[0].name, "read_file", "the MCP prefix is gone");
+        assert_eq!(output.tool_calls[0].input["path"], "a.rs");
+        assert_eq!(output.usage.output_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn a_step_waits_for_every_announced_call() {
+        let req = request(&[(Role::User, "read both")]);
+        let bridge = tools_bridge();
+        let (outcome, events) = run(&req, &sessions().await, Some(&bridge), false, vec![
+            init(),
+            SubprocessEvent::ToolUseStarted("toolu_1".into()),
+            SubprocessEvent::ToolUseStarted("toolu_2".into()),
+            tool_use("toolu_1"),
+            step_end("tool_use"),
+            tool_use("toolu_2"),
+        ]).await;
+        let Relay::Parked { tool_ids, .. } = outcome else { panic!("not parked") };
+        assert_eq!(tool_ids, ["toolu_1", "toolu_2"]);
+        let TurnEvent::Finished(output) = events.last().unwrap() else { panic!() };
+        assert_eq!(output.tool_calls.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_client_tools_do_not_park() {
+        let req = request(&[(Role::User, "hi")]);
+        let (outcome, _) = run(&req, &sessions().await, None, false, vec![
+            init(),
+            tool_use("toolu_1"),
+            step_end("tool_use"),
+            close(1),
+        ]).await;
+        assert!(matches!(outcome, Relay::Done));
+    }
+
+    #[tokio::test]
     async fn missing_session_before_init_asks_for_a_retry() {
         let req = request(&[(Role::User, "hi"), (Role::Assistant, "Hello"), (Role::User, "more")]);
-        let (outcome, events) = run(&req, &sessions().await, true, vec![
+        let (outcome, events) = run(&req, &sessions().await, None, true, vec![
             result(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
             close(1),
         ]).await;
-        assert_eq!(outcome, Relay::ResumeFailed);
+        assert!(matches!(outcome, Relay::ResumeFailed));
         assert!(events.is_empty(), "nothing reaches the client before the retry");
     }
 
     #[tokio::test]
     async fn fresh_session_errors_are_reported_not_retried() {
         let req = request(&[(Role::User, "hi")]);
-        let (outcome, events) = run(&req, &sessions().await, false, vec![
+        let (outcome, events) = run(&req, &sessions().await, None, false, vec![
             result(r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#),
             close(1),
         ]).await;
-        assert_eq!(outcome, Relay::Done);
+        assert!(matches!(outcome, Relay::Done));
         assert!(matches!(&events[..], [TurnEvent::Failed(e)] if e.status == 502));
     }
 
     #[tokio::test]
     async fn api_errors_keep_their_status() {
         let req = request(&[(Role::User, "hi")]);
-        let (_, events) = run(&req, &sessions().await, false, vec![
+        let (_, events) = run(&req, &sessions().await, None, false, vec![
             init(),
             result(r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":400,"result":"API Error: 400 Unable to download the file."}"#),
             close(1),
@@ -355,7 +662,7 @@ mod tests {
     async fn rejected_limit_turns_errors_into_429() {
         let req = request(&[(Role::User, "hi")]);
         let info = RateLimitInfo { status: Some("rejected".into()), windows: HashMap::new() };
-        let (_, events) = run(&req, &sessions().await, false, vec![
+        let (_, events) = run(&req, &sessions().await, None, false, vec![
             init(),
             SubprocessEvent::RateLimit(info),
             result(r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your limit"}"#),
@@ -367,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn exit_without_result_reports_stderr() {
         let req = request(&[(Role::User, "hi")]);
-        let (_, events) = run(&req, &sessions().await, false, vec![
+        let (_, events) = run(&req, &sessions().await, None, false, vec![
             SubprocessEvent::Close { code: 1, stderr_tail: "Invalid API key · Please run /login".into() },
         ]).await;
         let [TurnEvent::Failed(error)] = &events[..] else { panic!("{events:?}") };
@@ -378,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_is_a_504() {
         let req = request(&[(Role::User, "hi")]);
-        let (_, events) = run(&req, &sessions().await, false, vec![init(), SubprocessEvent::Timeout]).await;
+        let (_, events) = run(&req, &sessions().await, None, false, vec![init(), SubprocessEvent::Timeout]).await;
         assert!(matches!(&events[1], TurnEvent::Failed(e) if e.status == 504));
     }
 
@@ -386,7 +693,7 @@ mod tests {
     async fn streamed_text_is_remembered_when_it_differs_from_the_result() {
         let req = request(&[(Role::User, "hi")]);
         let store = sessions().await;
-        run(&req, &store, false, vec![
+        run(&req, &store, None, false, vec![
             init(),
             SubprocessEvent::TextDelta("Part one. ".into()),
             SubprocessEvent::TextDelta("Part two.".into()),
@@ -395,5 +702,38 @@ mod tests {
         ]).await;
         let next = request(&[(Role::User, "hi"), (Role::Assistant, "Part one. Part two."), (Role::User, "and?")]);
         assert_eq!(store.lookup(&next.conversation.history_key().unwrap()).await.as_deref(), Some("sid-3"));
+    }
+
+    fn parked(ids: &[&str], age: Duration) -> Parked {
+        let (_tx, rx) = mpsc::channel(1);
+        Parked {
+            process: Process::from_events(rx),
+            token: "tok".into(),
+            bridge: Arc::new(tools_bridge()),
+            model: "m".into(),
+            tool_ids: ids.iter().map(|s| s.to_string()).collect(),
+            since: Instant::now() - age,
+        }
+    }
+
+    #[test]
+    fn a_parked_turn_is_found_by_any_of_its_calls_once() {
+        let pending = PendingTurns::default();
+        pending.park(parked(&["t1", "t2"], Duration::ZERO));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.take("t2").is_some());
+        assert!(pending.take("t1").is_none(), "taken together with t2");
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn old_parked_turns_expire() {
+        let pending = PendingTurns::default();
+        pending.park(parked(&["old"], Duration::from_secs(3600)));
+        pending.park(parked(&["new"], Duration::ZERO));
+        let expired = pending.expire(Duration::from_secs(1800));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].tool_ids, ["old"]);
+        assert!(pending.take("new").is_some());
     }
 }

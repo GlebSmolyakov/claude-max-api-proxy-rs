@@ -12,8 +12,18 @@ pub struct MessagesRequest {
     #[serde(default)]
     pub stream: bool,
     pub system: Option<ContentInput>,
-    /// Client-side tools, which the CLI cannot call; ignored and logged.
-    pub tools: Option<Value>,
+    pub tools: Option<Vec<ToolSpec>>,
+    /// `{"type": "none"}` hides the tools from the model; other values are not enforced.
+    pub tool_choice: Option<Value>,
+}
+
+/// A client tool. Server tools such as web search have a versioned `type`
+/// and no `input_schema`; the proxy skips those.
+#[derive(Debug, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,14 +40,21 @@ pub enum ContentInput {
 }
 
 /// One content block. Only the fields of the block types the proxy reads
-/// are declared: `text`, `image` (`source`) and `tool_result` (`content`).
+/// are declared: `text`, `image` (`source`), `tool_use` (`id`, `name`,
+/// `input`) and `tool_result` (`tool_use_id`, `content`, `is_error`).
 #[derive(Debug, Deserialize)]
 pub struct ContentBlockInput {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: Option<String>,
     pub source: Option<Value>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub input: Option<Value>,
+    pub tool_use_id: Option<String>,
     pub content: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 // ── Response ───────────────────────────────────────────────────
@@ -48,7 +65,7 @@ pub struct MessagesResponse {
     #[serde(rename = "type")]
     pub response_type: String,
     pub role: String,
-    pub content: Vec<TextBlock>,
+    pub content: Vec<ResponseBlock>,
     pub model: String,
     pub stop_reason: String,
     pub stop_sequence: Option<String>,
@@ -56,10 +73,10 @@ pub struct MessagesResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct TextBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    pub text: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseBlock {
+    Text { text: String },
+    ToolUse { id: String, name: String, input: Value },
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq)]
@@ -90,6 +107,26 @@ mod tests {
     }
 
     #[test]
+    fn tools_tool_use_and_tool_result() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"tools":[{"name":"read_file","description":"Read","input_schema":{"type":"object"}},{"type":"web_search_20250305","name":"web_search"}],
+                "messages":[
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read_file","input":{"path":"a.rs"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"fn main() {}","is_error":false}]}
+            ]}"#,
+        )
+        .unwrap();
+        let tools = req.tools.unwrap();
+        assert!(tools[0].input_schema.is_some());
+        assert!(tools[1].input_schema.is_none(), "a server tool");
+        let ContentInput::Blocks(call) = &req.messages[1].content else { panic!() };
+        assert_eq!(call[0].name.as_deref(), Some("read_file"));
+        let ContentInput::Blocks(result) = &req.messages[2].content else { panic!() };
+        assert_eq!(result[0].tool_use_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[test]
     fn model_is_optional() {
         let req: MessagesRequest = serde_json::from_str(r#"{"messages":[{"role":"user","content":"hi"}]}"#).unwrap();
         assert_eq!(req.model, None);
@@ -110,7 +147,10 @@ mod tests {
             id: "msg_1".into(),
             response_type: "message".into(),
             role: "assistant".into(),
-            content: vec![TextBlock { block_type: "text".into(), text: "Hi".into() }],
+            content: vec![
+                ResponseBlock::Text { text: "Hi".into() },
+                ResponseBlock::ToolUse { id: "toolu_1".into(), name: "read_file".into(), input: serde_json::json!({}) },
+            ],
             model: "claude-haiku-4-5-20251001".into(),
             stop_reason: "end_turn".into(),
             stop_sequence: None,
@@ -119,6 +159,8 @@ mod tests {
         let v = serde_json::to_value(&response).unwrap();
         assert_eq!(v["type"], "message");
         assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][1]["type"], "tool_use");
+        assert_eq!(v["content"][1]["name"], "read_file");
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
     }
 }

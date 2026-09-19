@@ -1,19 +1,23 @@
 //! Runs one `claude --print` process per turn and turns its NDJSON output
 //! into events.
 
-use crate::types::claude_cli::{ClaudeCliMessage, RateLimitInfo, ResultMessage, StreamEvent};
+use crate::conversation::ToolCall;
+use crate::types::claude_cli::{
+    AssistantBlock, ClaudeCliMessage, RateLimitInfo, ResultMessage, ResultUsage, StartedBlock, StreamEvent,
+};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Also bounds how long a turn may wait for the client to run a tool.
+pub const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STDERR_TAIL_LINES: usize = 5;
 
 /// Environment that keeps the CLI a plain model instead of the user's agent.
-pub const CLEAN_ENV: [(&str, &str); 4] = [
+pub const CLEAN_ENV: [(&str, &str); 8] = [
     // No CLAUDE.md or memory files in the context.
     ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
     ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
@@ -21,13 +25,31 @@ pub const CLEAN_ENV: [(&str, &str); 4] = [
     ("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1"),
     // No update, telemetry or feature-flag calls at startup: about 1 s saved per turn.
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    // Client tools arrive through an MCP server. They must be in the prompt
+    // from the first call, not deferred behind tool search, and the tool
+    // list must come from this process's server, never from a cache.
+    ("ENABLE_TOOL_SEARCH", "false"),
+    ("MCP_DISCOVERY_CACHE", "0"),
+    ("MCP_CONNECTION_NONBLOCKING", "0"),
+    // Tool results such as whole files can be large.
+    ("MAX_MCP_OUTPUT_TOKENS", "100000"),
 ];
+
+/// Name of the MCP server that carries client tools. The model sees each
+/// tool as `mcp__c__<name>`.
+pub const MCP_SERVER: &str = "c";
 
 #[derive(Debug)]
 pub enum SubprocessEvent {
     /// The session started; `model` is the id the alias resolved to.
     Init { session_id: String, model: String },
     TextDelta(String),
+    /// A tool call began; its input follows in `ToolUse`.
+    ToolUseStarted(String),
+    /// A complete tool call. `name` still has the MCP prefix.
+    ToolUse(ToolCall),
+    /// One API call finished.
+    StepEnd { stop_reason: Option<String>, usage: Option<ResultUsage> },
     RateLimit(RateLimitInfo),
     Result(ResultMessage),
     /// The process could not be started or read.
@@ -44,8 +66,34 @@ pub struct SubprocessOptions {
     pub system_prompt: String,
     /// Continue this saved session, forking it.
     pub resume: Option<String>,
+    /// URL of the MCP server with the client's tools, when there are any.
+    pub mcp_url: Option<String>,
     pub cwd: String,
     pub api: &'static str,
+}
+
+/// A running CLI process. It lives as long as this value: dropping it kills
+/// the process, which is how an abandoned turn gets cleaned up.
+pub struct Process {
+    pub events: mpsc::Receiver<SubprocessEvent>,
+    _alive: oneshot::Sender<()>,
+}
+
+impl Process {
+    /// A process whose events come from `events`, for tests.
+    #[cfg(test)]
+    pub fn from_events(events: mpsc::Receiver<SubprocessEvent>) -> Self {
+        let (alive, _) = oneshot::channel();
+        Self { events, _alive: alive }
+    }
+}
+
+/// Start the CLI and write `input` (one NDJSON user message) to its stdin.
+pub fn spawn(input: String, options: SubprocessOptions) -> Process {
+    let (tx, events) = mpsc::channel(64);
+    let (alive, dropped) = oneshot::channel();
+    tokio::spawn(run(input, options, tx, dropped));
+    Process { events, _alive: alive }
 }
 
 pub fn build_args(options: &SubprocessOptions) -> Vec<String> {
@@ -74,6 +122,14 @@ pub fn build_args(options: &SubprocessOptions) -> Vec<String> {
         "--system-prompt".to_string(),
         options.system_prompt.clone(),
     ]);
+    if let Some(url) = &options.mcp_url {
+        args.extend([
+            "--mcp-config".to_string(),
+            mcp_config(url),
+            "--allowedTools".to_string(),
+            format!("mcp__{MCP_SERVER}"),
+        ]);
+    }
     if let Some(session_id) = &options.resume {
         args.extend([
             "--resume".to_string(),
@@ -84,13 +140,34 @@ pub fn build_args(options: &SubprocessOptions) -> Vec<String> {
     args
 }
 
-/// Spawn the CLI, write `input` (one NDJSON user message) to its stdin and
-/// forward what it prints. When the receiver goes away, the process is killed.
-pub async fn spawn_subprocess(input: String, options: SubprocessOptions, tx: mpsc::Sender<SubprocessEvent>) {
+/// `--mcp-config` for the client-tools server. `timeout` lifts the CLI's
+/// default 60 s limit per HTTP request: a call waits while the client runs
+/// the tool.
+pub fn mcp_config(url: &str) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            MCP_SERVER: {
+                "type": "http",
+                "url": url,
+                "alwaysLoad": true,
+                "timeout": INACTIVITY_TIMEOUT.as_millis() as u64,
+            }
+        }
+    })
+    .to_string()
+}
+
+async fn run(
+    input: String,
+    options: SubprocessOptions,
+    tx: mpsc::Sender<SubprocessEvent>,
+    mut dropped: oneshot::Receiver<()>,
+) {
     let rid = options.request_id.clone();
     let start = Instant::now();
     let mode = if options.resume.is_some() { "resume" } else { "fresh" };
-    info!("[req={rid}] Spawning claude model={} api={} session={mode}", options.model, options.api);
+    let tools = if options.mcp_url.is_some() { " tools=on" } else { "" };
+    info!("[req={rid}] Spawning claude model={} api={} session={mode}{tools}", options.model, options.api);
 
     let mut command = Command::new("claude");
     command
@@ -162,7 +239,7 @@ pub async fn spawn_subprocess(input: String, options: SubprocessOptions, tx: mps
                         }
                     }
                     if tx.send(event).await.is_err() {
-                        warn!("[req={rid}][pid={pid}] Client went away after {:.2}s, killing claude", start.elapsed().as_secs_f64());
+                        warn!("[req={rid}][pid={pid}] Nobody is listening after {:.2}s, killing claude", start.elapsed().as_secs_f64());
                         let _ = child.kill().await;
                         return;
                     }
@@ -182,6 +259,11 @@ pub async fn spawn_subprocess(input: String, options: SubprocessOptions, tx: mps
                     }
                     _ => stderr_open = false,
                 }
+            }
+            _ = &mut dropped => {
+                info!("[req={rid}][pid={pid}] Turn abandoned after {:.0}s, killing claude", start.elapsed().as_secs_f64());
+                let _ = child.kill().await;
+                return;
             }
             () = &mut progress => {
                 info!("[req={rid}][pid={pid}] Still running {:.0}s chunks={chunks}", start.elapsed().as_secs_f64());
@@ -251,15 +333,33 @@ fn process_line(line: &str) -> Vec<SubprocessEvent> {
                 model: s.model.unwrap_or_default(),
             }]
         }
-        ClaudeCliMessage::StreamEvent {
-            event: StreamEvent::ContentBlockDelta { delta },
-        } => match delta.text {
-            Some(text) if !text.is_empty() => vec![SubprocessEvent::TextDelta(text)],
+        ClaudeCliMessage::StreamEvent { event } => match event {
+            StreamEvent::ContentBlockDelta { delta } => match delta.text {
+                Some(text) if !text.is_empty() => vec![SubprocessEvent::TextDelta(text)],
+                _ => vec![],
+            },
+            StreamEvent::ContentBlockStart {
+                content_block: StartedBlock::ToolUse { id },
+            } => vec![SubprocessEvent::ToolUseStarted(id)],
+            StreamEvent::MessageDelta { delta, usage } => vec![SubprocessEvent::StepEnd {
+                stop_reason: delta.stop_reason,
+                usage,
+            }],
             _ => vec![],
         },
+        ClaudeCliMessage::Assistant { message } => message
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                AssistantBlock::ToolUse { id, name, input } => {
+                    Some(SubprocessEvent::ToolUse(ToolCall { id, name, input }))
+                }
+                AssistantBlock::Other => None,
+            })
+            .collect(),
         ClaudeCliMessage::RateLimit { rate_limit_info } => vec![SubprocessEvent::RateLimit(rate_limit_info)],
         ClaudeCliMessage::Result(result) => vec![SubprocessEvent::Result(result)],
-        _ => vec![],
+        ClaudeCliMessage::System(_) => vec![],
     }
 }
 
@@ -267,12 +367,13 @@ fn process_line(line: &str) -> Vec<SubprocessEvent> {
 mod tests {
     use super::*;
 
-    fn options(resume: Option<&str>) -> SubprocessOptions {
+    fn options(resume: Option<&str>, mcp_url: Option<&str>) -> SubprocessOptions {
         SubprocessOptions {
             request_id: "r".into(),
             model: "haiku".into(),
             system_prompt: "Be brief.".into(),
             resume: resume.map(String::from),
+            mcp_url: mcp_url.map(String::from),
             cwd: "/tmp".into(),
             api: "openai",
         }
@@ -284,7 +385,7 @@ mod tests {
 
     #[test]
     fn args_run_a_plain_model() {
-        let args = build_args(&options(None));
+        let args = build_args(&options(None, None));
         assert_eq!(value_after(&args, "--tools").as_deref(), Some(""));
         assert_eq!(value_after(&args, "--setting-sources").as_deref(), Some(""));
         assert_eq!(value_after(&args, "--input-format").as_deref(), Some("stream-json"));
@@ -292,35 +393,49 @@ mod tests {
         assert!(args.contains(&"--strict-mcp-config".to_string()));
         assert!(args.contains(&"--disable-slash-commands".to_string()));
         assert!(args.contains(&"--include-partial-messages".to_string()));
+        assert!(!args.contains(&"--mcp-config".to_string()), "no tools, no MCP server");
     }
 
     #[test]
     fn args_carry_model_and_system_prompt() {
-        let args = build_args(&options(None));
+        let args = build_args(&options(None, None));
         assert_eq!(value_after(&args, "--model").as_deref(), Some("haiku"));
         assert_eq!(value_after(&args, "--system-prompt").as_deref(), Some("Be brief."));
     }
 
     #[test]
     fn fresh_sessions_do_not_resume() {
-        let args = build_args(&options(None));
+        let args = build_args(&options(None, None));
         assert!(!args.contains(&"--resume".to_string()));
-        assert!(!args.contains(&"--fork-session".to_string()));
         assert!(!args.contains(&"--no-session-persistence".to_string()), "sessions must be saved to be resumed");
     }
 
     #[test]
     fn resumed_sessions_fork() {
-        let args = build_args(&options(Some("abc")));
+        let args = build_args(&options(Some("abc"), None));
         assert_eq!(value_after(&args, "--resume").as_deref(), Some("abc"));
         assert!(args.contains(&"--fork-session".to_string()));
     }
 
     #[test]
-    fn clean_env_disables_context_and_background_calls() {
-        let names: Vec<&str> = CLEAN_ENV.iter().map(|(k, _)| *k).collect();
-        assert!(names.contains(&"CLAUDE_CODE_DISABLE_CLAUDE_MDS"));
-        assert!(names.contains(&"CLAUDE_CODE_DISABLE_TERMINAL_TITLE"));
+    fn client_tools_come_through_an_allowed_mcp_server() {
+        let args = build_args(&options(None, Some("http://127.0.0.1:8080/mcp/tok")));
+        let config: serde_json::Value = serde_json::from_str(&value_after(&args, "--mcp-config").unwrap()).unwrap();
+        let server = &config["mcpServers"]["c"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], "http://127.0.0.1:8080/mcp/tok");
+        assert_eq!(server["alwaysLoad"], true);
+        assert!(server["timeout"].as_u64().unwrap() > 60_000, "above the CLI's 60 s default");
+        assert_eq!(value_after(&args, "--allowedTools").as_deref(), Some("mcp__c"));
+    }
+
+    #[test]
+    fn clean_env_disables_context_background_calls_and_tool_deferral() {
+        let env: std::collections::HashMap<&str, &str> = CLEAN_ENV.into_iter().collect();
+        assert_eq!(env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1");
+        assert_eq!(env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"], "1");
+        assert_eq!(env["ENABLE_TOOL_SEARCH"], "false");
+        assert_eq!(env["MCP_DISCOVERY_CACHE"], "0");
     }
 
     #[test]
@@ -344,8 +459,24 @@ mod tests {
     }
 
     #[test]
-    fn assistant_lines_are_not_forwarded() {
+    fn assistant_text_lines_are_not_forwarded() {
         assert!(process_line(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"}]}}"#).is_empty());
+    }
+
+    #[test]
+    fn tool_calls_and_step_ends_are_forwarded() {
+        let started = process_line(r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__c__x","input":{}}}}"#);
+        assert!(matches!(&started[..], [SubprocessEvent::ToolUseStarted(id)] if id == "toolu_1"));
+
+        let call = process_line(r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"mcp__c__read_file","input":{"path":"a.rs"}}]}}"#);
+        let [SubprocessEvent::ToolUse(call)] = &call[..] else { panic!("{call:?}") };
+        assert_eq!((call.id.as_str(), call.name.as_str()), ("toolu_1", "mcp__c__read_file"));
+        assert_eq!(call.input["path"], "a.rs");
+
+        let end = process_line(r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":10,"output_tokens":5}}}"#);
+        let [SubprocessEvent::StepEnd { stop_reason, usage }] = &end[..] else { panic!("{end:?}") };
+        assert_eq!(stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(usage.unwrap().input_tokens, 10);
     }
 
     #[test]
@@ -360,6 +491,6 @@ mod tests {
     fn garbage_is_ignored() {
         assert!(process_line("").is_empty());
         assert!(process_line("not json").is_empty());
-        assert!(process_line(r#"{"type":"user"}"#).is_empty());
+        assert!(process_line(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#).is_empty());
     }
 }

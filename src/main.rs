@@ -1,4 +1,5 @@
 mod adapter;
+mod bridge;
 mod conversation;
 mod error;
 mod models;
@@ -86,7 +87,11 @@ async fn main() {
         cwd: cwd.to_string_lossy().to_string(),
         sessions,
         status: Arc::new(status::RuntimeStatus::new(cli_version)),
+        bridges: bridge::Bridges::default(),
+        pending: Arc::new(turn::PendingTurns::default()),
+        mcp_base: format!("http://127.0.0.1:{}/mcp", args.port),
     };
+    turn::spawn_expiry_task(state.clone());
 
     let app = server::create_router(state);
 

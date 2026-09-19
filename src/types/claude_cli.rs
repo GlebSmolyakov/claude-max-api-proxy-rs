@@ -4,6 +4,7 @@
 //! line types the proxy does not care about fail to parse and are skipped.
 
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
@@ -12,10 +13,11 @@ pub enum ClaudeCliMessage {
     #[serde(rename = "system")]
     System(SystemMessage),
 
-    /// Whole assistant messages. With `--include-partial-messages` the same
-    /// text also arrives as stream deltas, so these are not forwarded.
+    /// One finished content block of the assistant message. Text also
+    /// arrives as stream deltas, so only tool calls are read from here: they
+    /// carry the complete input.
     #[serde(rename = "assistant")]
-    Assistant {},
+    Assistant { message: AssistantMessage },
 
     #[serde(rename = "stream_event")]
     StreamEvent { event: StreamEvent },
@@ -36,15 +38,64 @@ pub struct SystemMessage {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AssistantMessage {
+    #[serde(default)]
+    pub content: Vec<AssistantBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum AssistantBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+
+    #[serde(other)]
+    Other,
+}
+
 /// Raw Messages API stream events, forwarded by the CLI.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum StreamEvent {
+    #[serde(rename = "content_block_start")]
+    ContentBlockStart { content_block: StartedBlock },
+
     #[serde(rename = "content_block_delta")]
     ContentBlockDelta { delta: Delta },
 
+    /// The end of one API call: why it stopped and what it cost.
+    #[serde(rename = "message_delta")]
+    MessageDelta {
+        #[serde(default)]
+        delta: MessageDeltaInfo,
+        usage: Option<ResultUsage>,
+    },
+
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub enum StartedBlock {
+    /// Announces a tool call before its input is complete.
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String },
+
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MessageDeltaInfo {
+    /// `end_turn`, `tool_use`, `max_tokens`, …
+    pub stop_reason: Option<String>,
 }
 
 /// `text_delta` carries `text`; `thinking_delta` and `signature_delta` do
@@ -180,11 +231,41 @@ mod tests {
     }
 
     #[test]
-    fn other_stream_events_and_assistant_lines_parse_as_ignorable() {
+    fn other_stream_events_parse_as_ignorable() {
         let start = r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"x"}}}"#;
         assert!(matches!(parse(start), ClaudeCliMessage::StreamEvent { event: StreamEvent::Other }));
-        let assistant = r#"{"type":"assistant","message":{"model":"x","content":[{"type":"text","text":"Hi"}]}}"#;
-        assert!(matches!(parse(assistant), ClaudeCliMessage::Assistant {}));
+        let text_start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}"#;
+        assert!(matches!(
+            parse(text_start),
+            ClaudeCliMessage::StreamEvent { event: StreamEvent::ContentBlockStart { content_block: StartedBlock::Other } }
+        ));
+    }
+
+    #[test]
+    fn assistant_text_blocks_are_other_and_tool_use_blocks_carry_input() {
+        let text = r#"{"type":"assistant","message":{"model":"x","content":[{"type":"text","text":"Hi"}]}}"#;
+        let ClaudeCliMessage::Assistant { message } = parse(text) else { panic!() };
+        assert!(matches!(message.content[..], [AssistantBlock::Other]));
+
+        // Captured from CLI 2.1.278 calling a tool through an MCP server.
+        let tool = r#"{"type":"assistant","message":{"model":"claude-haiku-4-5-20251001","content":[{"type":"tool_use","id":"toolu_019vyESf3ToWrVN4jfgMTXtN","name":"mcp__c__get_weather","input":{"city":"Lisbon"},"caller":{"type":"direct"}}]}}"#;
+        let ClaudeCliMessage::Assistant { message } = parse(tool) else { panic!() };
+        let [AssistantBlock::ToolUse { id, name, input }] = &message.content[..] else { panic!() };
+        assert_eq!(id, "toolu_019vyESf3ToWrVN4jfgMTXtN");
+        assert_eq!(name, "mcp__c__get_weather");
+        assert_eq!(input["city"], "Lisbon");
+    }
+
+    #[test]
+    fn tool_use_block_start_and_step_end() {
+        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__c__x","input":{}}}}"#;
+        let ClaudeCliMessage::StreamEvent { event: StreamEvent::ContentBlockStart { content_block: StartedBlock::ToolUse { id } } } = parse(start) else { panic!() };
+        assert_eq!(id, "toolu_1");
+
+        let end = r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":1143,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":128}}}"#;
+        let ClaudeCliMessage::StreamEvent { event: StreamEvent::MessageDelta { delta, usage } } = parse(end) else { panic!() };
+        assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
+        assert_eq!(usage.unwrap().output_tokens, 128);
     }
 
     #[test]

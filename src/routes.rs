@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::adapter::{anthropic_to_cli, cli_to_anthropic, cli_to_openai, openai_to_cli};
 use crate::error::AppError;
@@ -37,6 +37,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "cli_version": state.status.cli_version(),
         "workdir": state.cwd,
         "saved_sessions": state.sessions.len().await,
+        // Turns waiting for a client to run tools and send the results.
+        "waiting_for_tools": state.pending.len(),
         "models": state.status.aliases(),
         // What the subscription has used, as of the last turn; null before it.
         "rate_limits": state.status.rate_limits(),
@@ -82,13 +84,11 @@ pub async fn chat_completions(
     let request_id = generate_request_id();
 
     info!(
-        "[req={request_id}] OpenAI chat model={model} stream={} turns={}",
+        "[req={request_id}] OpenAI chat model={model} stream={} turns={} tools={}",
         request.stream,
-        conversation.turns().len()
+        conversation.turns().len(),
+        conversation.tools.len()
     );
-    if request.tools.is_some() {
-        warn!("[req={request_id}] Ignoring client tools: the CLI cannot call them");
-    }
 
     let turn = TurnRequest {
         request_id: request_id.clone(),
@@ -158,13 +158,11 @@ async fn handle_messages(
     let request_id = generate_request_id();
 
     info!(
-        "[req={request_id}] Anthropic messages model={model} stream={} turns={}",
+        "[req={request_id}] Anthropic messages model={model} stream={} turns={} tools={}",
         request.stream,
-        conversation.turns().len()
+        conversation.turns().len(),
+        conversation.tools.len()
     );
-    if request.tools.is_some() {
-        warn!("[req={request_id}] Ignoring client tools: the CLI cannot call them");
-    }
 
     let turn = TurnRequest {
         request_id: request_id.clone(),
