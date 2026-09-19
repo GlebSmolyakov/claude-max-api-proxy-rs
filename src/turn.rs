@@ -8,14 +8,14 @@
 //! client's next request carries the result, finds the parked turn by the
 //! tool call id, and the same process goes on.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::bridge::{Bridge, ToolOutcome};
-use crate::conversation::{Block, Conversation, ToolCall, ToolResult};
+use crate::conversation::{Block, Conversation, ToolCall};
 use crate::server::AppState;
 use crate::session::SessionStore;
 use crate::status::RuntimeStatus;
@@ -72,7 +72,7 @@ async fn drive(state: AppState, request: TurnRequest, tx: mpsc::Sender<TurnEvent
     let results = request.conversation.tool_results();
     if let Some(first) = results.first() {
         if let Some(parked) = state.pending.take(&first.tool_use_id) {
-            continue_parked(&state, &request, parked, &results, &tx).await;
+            continue_parked(&state, &request, parked, &tx).await;
             return;
         }
         info!("[req={rid}] Tool results for a turn this proxy no longer holds, replaying the history");
@@ -139,32 +139,24 @@ async fn drive(state: AppState, request: TurnRequest, tx: mpsc::Sender<TurnEvent
 
 /// Hand the client's tool results to the parked process and relay what the
 /// model does next.
-async fn continue_parked(
-    state: &AppState,
-    request: &TurnRequest,
-    parked: Parked,
-    results: &[ToolResult],
-    tx: &mpsc::Sender<TurnEvent>,
-) {
+async fn continue_parked(state: &AppState, request: &TurnRequest, parked: Parked, tx: &mpsc::Sender<TurnEvent>) {
     let rid = &request.request_id;
-    info!("[req={rid}] Continuing a parked turn with {} tool result(s)", results.len());
-
-    // Text the user added next to the results cannot become a new message
-    // in the middle of a turn, so it rides along with the last result.
-    let note = request.conversation.last_text();
-    let mut delivered = HashSet::new();
-    for (i, result) in results.iter().enumerate() {
-        let mut content = result.content.clone();
-        if i + 1 == results.len() && !note.is_empty() {
-            content.push(Block::Text(format!("\n\n[The user also wrote]\n{note}")));
-        }
-        parked.bridge.deliver(&result.tool_use_id, ToolOutcome { content, is_error: result.is_error });
-        delivered.insert(result.tool_use_id.clone());
-    }
-    for id in parked.tool_ids.iter().filter(|id| !delivered.contains(*id)) {
-        warn!("[req={rid}] The client sent no result for tool call {id}");
-        let content = vec![Block::Text("The client returned no result for this call.".to_string())];
-        parked.bridge.deliver(id, ToolOutcome { content, is_error: true });
+    let outcomes = outcomes_for(&request.conversation, &parked.tool_ids);
+    let missing = outcomes.iter().filter(|(_, o)| o.is_none()).count();
+    info!(
+        "[req={rid}] Continuing a parked turn with {} of {} tool result(s)",
+        outcomes.len() - missing,
+        outcomes.len()
+    );
+    for (id, outcome) in outcomes {
+        let outcome = outcome.unwrap_or_else(|| {
+            warn!("[req={rid}] The client sent no result for tool call {id}");
+            ToolOutcome {
+                content: vec![Block::Text("The client returned no result for this call.".to_string())],
+                is_error: true,
+            }
+        });
+        parked.bridge.deliver(&id, outcome);
     }
 
     let Parked { process, token, bridge, model, .. } = parked;
@@ -188,6 +180,29 @@ async fn continue_parked(
         }
         _ => state.bridges.remove(&token),
     }
+}
+
+/// The result for each of `tool_ids`, looked up across the whole
+/// conversation; `None` where the client sent none. Text the user added next
+/// to the results cannot become a new message in the middle of a turn, so it
+/// rides along with the last result.
+fn outcomes_for(conversation: &Conversation, tool_ids: &[String]) -> Vec<(String, Option<ToolOutcome>)> {
+    let note = conversation.last_text();
+    let mut outcomes: Vec<(String, Option<ToolOutcome>)> = tool_ids
+        .iter()
+        .map(|id| {
+            let outcome = conversation
+                .find_tool_result(id)
+                .map(|r| ToolOutcome { content: r.content, is_error: r.is_error });
+            (id.clone(), outcome)
+        })
+        .collect();
+    if !note.is_empty()
+        && let Some((_, Some(last))) = outcomes.iter_mut().rev().find(|(_, o)| o.is_some())
+    {
+        last.content.push(Block::Text(format!("\n\n[The user also wrote]\n{note}")));
+    }
+    outcomes
 }
 
 struct RelayCtx<'a> {
@@ -266,7 +281,9 @@ async fn relay(ctx: RelayCtx<'_>, mut process: Process, tx: &mpsc::Sender<TurnEv
                     if ctx.resuming && !started {
                         return Relay::ResumeFailed;
                     }
-                    let _ = tx.send(TurnEvent::Failed(error_from_result(&result, limit_rejected))).await;
+                    let error = error_from_result(&result, limit_rejected);
+                    log_failure(&ctx.request.request_id, &error);
+                    let _ = tx.send(TurnEvent::Failed(error)).await;
                 } else {
                     let output = TurnOutput {
                         text: result.result.clone().unwrap_or_else(|| streamed.clone()),
@@ -284,7 +301,9 @@ async fn relay(ctx: RelayCtx<'_>, mut process: Process, tx: &mpsc::Sender<TurnEv
             }
             SubprocessEvent::Error(message) => {
                 if !answered {
-                    let _ = tx.send(TurnEvent::Failed(TurnError { status: 502, message })).await;
+                    let error = TurnError { status: 502, message };
+                    log_failure(&ctx.request.request_id, &error);
+                    let _ = tx.send(TurnEvent::Failed(error)).await;
                     answered = true;
                 }
             }
@@ -294,6 +313,7 @@ async fn relay(ctx: RelayCtx<'_>, mut process: Process, tx: &mpsc::Sender<TurnEv
                         status: 504,
                         message: "claude produced no output for 30 minutes".to_string(),
                     };
+                    log_failure(&ctx.request.request_id, &error);
                     let _ = tx.send(TurnEvent::Failed(error)).await;
                     answered = true;
                 }
@@ -308,7 +328,9 @@ async fn relay(ctx: RelayCtx<'_>, mut process: Process, tx: &mpsc::Sender<TurnEv
                         message.push_str(": ");
                         message.push_str(&stderr_tail);
                     }
-                    let _ = tx.send(TurnEvent::Failed(TurnError { status: 502, message })).await;
+                    let error = TurnError { status: 502, message };
+                    log_failure(&ctx.request.request_id, &error);
+                    let _ = tx.send(TurnEvent::Failed(error)).await;
                 }
                 return Relay::Done;
             }
@@ -349,6 +371,12 @@ async fn remember(sessions: &SessionStore, conversation: &Conversation, text: &s
             .remember(conversation.key_after_reply(streamed), session_id.to_string())
             .await;
     }
+}
+
+/// Every failure reaches the log with its message: a streaming client gets
+/// it inside the stream, where it would otherwise be seen by no one else.
+fn log_failure(request_id: &str, error: &TurnError) {
+    warn!("[req={request_id}] Failed with {}: {}", error.status, error.message);
 }
 
 fn error_from_result(result: &ResultMessage, limit_rejected: bool) -> TurnError {
@@ -702,6 +730,26 @@ mod tests {
         ]).await;
         let next = request(&[(Role::User, "hi"), (Role::Assistant, "Part one. Part two."), (Role::User, "and?")]);
         assert_eq!(store.lookup(&next.conversation.history_key().unwrap()).await.as_deref(), Some("sid-3"));
+    }
+
+    #[test]
+    fn outcomes_come_from_anywhere_in_the_history() {
+        let mut b = ConversationBuilder::new();
+        let call = |id: &str| Block::ToolUse(ToolCall { id: id.into(), name: "shell".into(), input: json!({}) });
+        let result = |id: &str, out: &str| Block::ToolResult { tool_use_id: id.into(), content: vec![Block::Text(out.into())], is_error: false };
+        b.push(Role::User, vec![Block::Text("look".into())]);
+        b.push(Role::Assistant, vec![call("t1")]);
+        b.push(Role::User, vec![result("t1", "one")]);
+        b.push(Role::Assistant, vec![call("t2")]);
+        b.push(Role::User, vec![result("t2", "two"), Block::Text("and hurry".into())]);
+        let c = b.build().unwrap();
+
+        let outcomes = outcomes_for(&c, &["t1".into(), "t2".into(), "t3".into()]);
+        assert_eq!(outcomes[0].1.as_ref().unwrap().content, vec![Block::Text("one".into())]);
+        let second = &outcomes[1].1.as_ref().unwrap().content;
+        assert_eq!(second[0], Block::Text("two".into()));
+        assert!(matches!(&second[1], Block::Text(t) if t.ends_with("and hurry")), "the note rides with the last result");
+        assert!(outcomes[2].1.is_none(), "t3 was never answered");
     }
 
     fn parked(ids: &[&str], age: Duration) -> Parked {

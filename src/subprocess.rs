@@ -211,6 +211,9 @@ async fn run(
     let mut stderr_open = true;
     let mut ttft: Option<f64> = None;
     let mut chunks: u64 = 0;
+    // Lines since the last progress report; an idle process, such as one
+    // parked while the client runs tools, reports nothing.
+    let mut recent_lines: u64 = 0;
 
     let inactivity = tokio::time::sleep(INACTIVITY_TIMEOUT);
     tokio::pin!(inactivity);
@@ -229,6 +232,7 @@ async fn run(
                     }
                 };
                 inactivity.as_mut().reset(tokio::time::Instant::now() + INACTIVITY_TIMEOUT);
+                recent_lines += 1;
                 for event in process_line(&line) {
                     if matches!(event, SubprocessEvent::TextDelta(_)) {
                         chunks += 1;
@@ -266,7 +270,10 @@ async fn run(
                 return;
             }
             () = &mut progress => {
-                info!("[req={rid}][pid={pid}] Still running {:.0}s chunks={chunks}", start.elapsed().as_secs_f64());
+                if recent_lines > 0 {
+                    info!("[req={rid}][pid={pid}] Still running {:.0}s chunks={chunks}", start.elapsed().as_secs_f64());
+                    recent_lines = 0;
+                }
                 progress.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
             }
             () = &mut inactivity => {

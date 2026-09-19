@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::adapter::{anthropic_to_cli, cli_to_anthropic, cli_to_openai, openai_to_cli};
 use crate::error::AppError;
@@ -220,7 +220,7 @@ async fn collect(request_id: &str, mut events: mpsc::Receiver<TurnEvent>) -> Res
                 return Ok(output);
             }
             TurnEvent::Failed(e) => {
-                error!("[req={request_id}] Failed after {:.2}s: {}", start.elapsed().as_secs_f64(), e.message);
+                info!("[req={request_id}] Failed after {:.2}s", start.elapsed().as_secs_f64());
                 return Err(AppError::upstream(e));
             }
             TurnEvent::Started { .. } | TurnEvent::Delta(_) => {}

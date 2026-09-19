@@ -161,6 +161,21 @@ impl Conversation {
             .collect()
     }
 
+    /// The latest result for tool call `tool_use_id`, wherever it is in the
+    /// conversation. Some clients (Goose among them) store parallel calls as
+    /// consecutive call-and-result pairs, so the results of one step can be
+    /// spread over several turns.
+    pub fn find_tool_result(&self, tool_use_id: &str) -> Option<ToolResult> {
+        self.turns.iter().rev().flat_map(|t| t.blocks.iter()).find_map(|b| match b {
+            Block::ToolResult { tool_use_id: id, content, is_error } if id == tool_use_id => Some(ToolResult {
+                tool_use_id: id.clone(),
+                content: content.clone(),
+                is_error: *is_error,
+            }),
+            _ => None,
+        })
+    }
+
     /// Plain text the client added to its last turn next to tool results.
     pub fn last_text(&self) -> String {
         self.last()
@@ -511,6 +526,22 @@ mod tests {
         let ids: Vec<String> = c.tool_results().into_iter().map(|r| r.tool_use_id).collect();
         assert_eq!(ids, ["t1", "t2"]);
         assert_eq!(c.last_text(), "also, hurry");
+    }
+
+    #[test]
+    fn tool_results_are_found_across_turns() {
+        // Goose writes a two-call step as call, result, call, result.
+        let mut b = ConversationBuilder::new();
+        b.push(Role::User, vec![text("look around")]);
+        b.push(Role::Assistant, vec![Block::ToolUse(call("t1"))]);
+        b.push(Role::User, vec![result("t1", "first")]);
+        b.push(Role::Assistant, vec![Block::ToolUse(call("t2"))]);
+        b.push(Role::User, vec![result("t2", "second")]);
+        let c = b.build().unwrap();
+        assert_eq!(c.tool_results().len(), 1, "only t2 is in the last turn");
+        assert_eq!(c.find_tool_result("t1").unwrap().content, vec![text("first")]);
+        assert_eq!(c.find_tool_result("t2").unwrap().content, vec![text("second")]);
+        assert!(c.find_tool_result("t3").is_none());
     }
 
     #[test]
